@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
-osu! Beatmap Downloader
-=======================
+Circlewave
+==========
 
-A PySide6 desktop browser + batch downloader for osu! beatmaps.
+A PySide6 desktop browser + batch downloader for osu! beatmaps, with a
+synthwave/neon look. Search the catalogue, preview audio, queue downloads with
+mirror fallback, and auto-build osu!stable collections from Beatmap Pack medals.
 
-Data source : catboy.best (formerly Mino/Kitsu) osu!-web-compatible mirror API.
-              No auth required. Falls back across nerinyan / beatconnect / sayobot
-              for the actual .osz download if catboy is slow or refuses a set.
+Data source : Nerinyan (https://api.nerinyan.moe) osu!-web-compatible mirror API.
+              No auth required. The actual .osz download falls back across
+              nerinyan / sayobot / catboy / beatconnect.
 
 Features
 --------
 * A-Z catalog        : empty query + "Title (A-Z)" sort + infinite scroll.
 * Search             : free-text over title / artist / mapper / tags.
-* Filters            : game mode, status (ranked/loved/graveyard/...), genre,
-                       language, BPM range, star-rating range. Ranges are applied
-                       both as osu!-web query keywords AND client-side, so the grid
-                       is guaranteed to respect them whatever the server does.
+* Filters            : game mode, status (ranked/loved/graveyard/...), search
+                       field (mapper/title/...), BPM range, star-rating range.
+                       BPM/star ranges are applied client-side, so the grid is
+                       guaranteed to respect them whatever the server returns.
 * Sort               : relevance, title, artist, difficulty, ranked date, rating,
                        plays, favourites.
 * Audio preview      : streams b.ppy.sh/preview/{id}.mp3 (needs QtMultimedia codecs).
@@ -78,8 +80,12 @@ except Exception:  # pragma: no cover
 # ----------------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------------
-ORG_NAME = "justin-tools"
-APP_NAME = "osu-beatmap-downloader"
+# Branding. APP_TITLE is the one place to change the product name -- it drives
+# the window title and the header wordmark.
+APP_TITLE = "Circlewave"
+APP_TAGLINE = "osu! beatmap browser & downloader"
+ORG_NAME = "AmarilloNL"
+APP_NAME = "Circlewave"
 
 NERINYAN_SEARCH = "https://api.nerinyan.moe/search"   # POST JSON body; returns osu!-web array
 PREVIEW_URL = "https://b.ppy.sh/preview/{id}.mp3"
@@ -138,24 +144,6 @@ SEARCH_FIELDS = [
     ("Tags", "tag"),
 ]
 
-# osu! genre ids (filtered client-side; the mirror has no genre query param).
-GENRES = [
-    ("Any genre", 0),
-    ("Video Game", 2),
-    ("Anime", 3),
-    ("Rock", 4),
-    ("Pop", 5),
-    ("Novelty", 7),
-    ("Hip Hop", 9),
-    ("Electronic", 10),
-    ("Metal", 11),
-    ("Classical", 12),
-    ("Folk", 13),
-    ("Jazz", 14),
-    ("Other", 6),
-    ("Unspecified", 1),
-]
-
 # Preset ranges for the BPM / Stars dropdowns. Each value is (min, max); 0 = open.
 BPM_RANGES = [
     ("Any BPM", (0, 0)),
@@ -212,7 +200,6 @@ class Beatmapset:
     cover_url: str
     diffs: list = field(default_factory=list)
     minimal: bool = False   # built from a pack page (id + name only)
-    genre_id: int = 0
 
     @property
     def sr_range(self) -> tuple:
@@ -255,11 +242,6 @@ class Beatmapset:
                 version=b.get("version", ""),
             ))
         diffs.sort(key=lambda d: d.sr)
-        genre = js.get("genre") or {}
-        try:
-            gid = int(genre.get("id") or 0)
-        except (TypeError, ValueError):
-            gid = 0
         return cls(
             id=sid,
             title=js.get("title", "(unknown)"),
@@ -271,7 +253,6 @@ class Beatmapset:
             favourite_count=int(js.get("favourite_count", 0) or 0),
             cover_url=cover,
             diffs=diffs,
-            genre_id=gid,
         )
 
     @classmethod
@@ -293,11 +274,9 @@ class Beatmapset:
 # API CLIENT
 # ----------------------------------------------------------------------------
 def passes_range(s: "Beatmapset", f: dict) -> bool:
-    """Client-side BPM / star-rating / genre filter (Nerinyan's GET API has no
+    """Client-side BPM / star-rating range filter (Nerinyan's GET API has no
     query param for these). A set matches if ANY of its difficulties falls in
     range -- same semantics as the site's server-side filter."""
-    if f.get("genre") and s.genre_id != f["genre"]:
-        return False
     if f["bpm_min"] or f["bpm_max"]:
         bpms = [d.bpm for d in s.diffs if d.bpm] or ([s.bpm] if s.bpm else [])
         if bpms:
@@ -321,10 +300,10 @@ def passes_range(s: "Beatmapset", f: dict) -> bool:
 def search_beatmapsets(filters: dict, token) -> tuple:
     """Query Nerinyan (GET) and return (list[Beatmapset], next_token|None).
 
-    Uses Nerinyan's query-param interface (q/m/s/sort/p/ps), which is the form
-    its own frontend and other tools use. BPM/star ranges aren't query params on
-    that API, so they're applied client-side here. Pagination is page-based:
-    `token` is None on the first page, then the next page index returned here.
+    Uses Nerinyan's query-param interface (q/m/s/sort/p/ps). BPM/star ranges
+    aren't query params on that API, so they're applied client-side here.
+    Pagination is page-based: `token` is None on the first page, then the next
+    page index returned here.
     """
     page = 0 if token is None else int(token)
     params = {
@@ -345,7 +324,7 @@ def search_beatmapsets(filters: dict, token) -> tuple:
     data = r.json()
     raw = data if isinstance(data, list) else data.get("beatmapsets", [])
     sets = [Beatmapset.from_json(s) for s in raw]
-    if any(filters.get(k) for k in ("bpm_min", "bpm_max", "sr_min", "sr_max", "genre")):
+    if any(filters.get(k) for k in ("bpm_min", "bpm_max", "sr_min", "sr_max")):
         sets = [s for s in sets if passes_range(s, filters)]
     # Pagination tracks the raw page size, not the post-filter count.
     next_token = page + 1 if len(raw) >= PAGE_SIZE else None
@@ -556,18 +535,37 @@ def parse_pack_medals(markdown: str) -> list:
     return medals
 
 
-_PACK_SET_RE = re.compile(r"/beatmapsets/(\d+)\"[^>]*>([^<]+)<")
+# Each pack entry looks like:
+#   <a href="...beatmapsets/123" class="beatmap-pack-items__link">
+#     <span class="beatmap-pack-items__artist">Artist</span>
+#     <span class="beatmap-pack-items__title"> - Title</span></a>
+_PACK_SET_RE = re.compile(
+    r'/beatmapsets/(\d+)"[^>]*class="beatmap-pack-items__link"[^>]*>'
+    r'\s*<span class="beatmap-pack-items__artist">([^<]*)</span>'
+    r'\s*<span class="beatmap-pack-items__title">([^<]*)</span>', re.S)
+_PACK_ID_RE = re.compile(r'/beatmapsets/(\d+)')
 
 
 def parse_pack_page(html_text: str) -> list:
-    """Parse a pack page into [(set_id, 'Artist - Title'), ...] (deduped, ordered)."""
+    """Parse a pack page into [(set_id, 'Artist - Title'), ...] (deduped, ordered).
+    The title span already carries the ' - ' separator, so artist+title rebuilds
+    the familiar 'Artist - Title' string. Falls back to ids-only if the markup
+    ever changes (covers still load; names just stay blank)."""
     import html as _html
     out, seen = [], set()
-    for sid, name in _PACK_SET_RE.findall(html_text):
+    for sid, artist, title in _PACK_SET_RE.findall(html_text):
         sid = int(sid)
+        if sid in seen:
+            continue
+        seen.add(sid)
+        out.append((sid, _html.unescape((artist + title).strip())))
+    if out:
+        return out
+    for raw in _PACK_ID_RE.findall(html_text):     # fallback: ids only
+        sid = int(raw)
         if sid not in seen:
             seen.add(sid)
-            out.append((sid, _html.unescape(name.strip())))
+            out.append((sid, ""))
     return out
 
 
@@ -596,6 +594,23 @@ def fetch_pack_contents(tags: list) -> list:
     if not out:
         raise RuntimeError("no beatmaps found for this pack")
     return out
+
+
+def fetch_set_meta(set_id: int, name: str) -> tuple:
+    """Best-effort full metadata for one pack map. The mirror has no per-set
+    endpoint, so we run the normal text search for the map's name and match the
+    exact set id in the results. Returns (set_id, Beatmapset); raises if the set
+    doesn't surface (the card then keeps its artist/title from the pack page)."""
+    if not name:
+        raise RuntimeError("no name to search")
+    f = {"q": name, "status": "all", "sort": "title_asc", "mode": None,
+         "option": "", "bpm_min": 0, "bpm_max": 0, "sr_min": 0, "sr_max": 0,
+         "hide_owned": False, "no_video": False}
+    sets, _ = search_beatmapsets(f, None)
+    for s in sets:
+        if s.id == set_id:
+            return set_id, s
+    raise RuntimeError(f"set {set_id} not found via search")
 
 
 # ----------------------------------------------------------------------------
@@ -800,34 +815,31 @@ class FlowLayout(QLayout):
         if avail <= 0 or not self._items:
             return m.top() + m.bottom()
 
-        # group items into rows greedily by their minimum (sizeHint) widths
-        rows = []          # each: (list_of_items, used_width_including_gaps)
-        cur, cur_w = [], 0
-        for it in self._items:
-            iw = it.sizeHint().width()
-            if cur and cur_w + sp + iw > avail:
-                rows.append((cur, cur_w))
-                cur, cur_w = [], 0
-            cur_w = (cur_w + sp + iw) if cur else iw
-            cur.append(it)
-        if cur:
-            rows.append((cur, cur_w))
+        # Uniform responsive grid: pick a column count from the cards' min width,
+        # then give every card the SAME width that fills a full row. A partial
+        # last row keeps that width and left-aligns (no stretching to fill).
+        base_w = max(it.sizeHint().width() for it in self._items)
+        cols = max(1, int((avail + sp) // (base_w + sp)))
+        card_w = (avail - (cols - 1) * sp) / cols
 
-        # lay out each row, distributing leftover width evenly so it fills fully
         y = rect.y() + m.top()
-        for items, used_w in rows:
-            n = len(items)
-            extra = max(0.0, avail - used_w) / n     # widen each card equally
-            h = max(it.sizeHint().height() for it in items)
-            x = float(left)
-            for it in items:
-                w = it.sizeHint().width() + extra
-                if not test_only:
-                    it.setGeometry(QRect(int(round(x)), int(round(y)),
-                                         int(round(w)), int(h)))
-                x += w + sp
-            y += h + sp
-        return int(y - sp - rect.y() + m.bottom())
+        x = float(left)
+        col = 0
+        row_h = 0
+        for it in self._items:
+            if col == cols:                      # wrap to next row
+                x = float(left)
+                y += row_h + sp
+                col, row_h = 0, 0
+            h = it.sizeHint().height()
+            if not test_only:
+                it.setGeometry(QRect(int(round(x)), int(round(y)),
+                                     int(round(card_w)), int(h)))
+            x += card_w + sp
+            row_h = max(row_h, h)
+            col += 1
+        y += row_h
+        return int(y - rect.y() + m.bottom())
 
 
 # ----------------------------------------------------------------------------
@@ -885,36 +897,30 @@ class BeatmapCard(QFrame):
         if s.minimal:
             self.sr_badge.hide()
 
-        # --- info block ---
+        # --- info block (labels always present; filled from whatever we have) ---
         body = QVBoxLayout()
         body.setContentsMargins(13, 1, 13, 0)
         body.setSpacing(4)
 
-        self.title_lbl = QLabel(elide(s.title, self.CARD_W - 28, bold=True, px=17))
+        self.title_lbl = QLabel()
         self.title_lbl.setObjectName("title")
-        self.title_lbl.setToolTip(f"{s.artist} - {s.title}")
         body.addWidget(self.title_lbl)
 
-        self.artist_lbl = QLabel(elide(s.artist, self.CARD_W - 28, px=14))
+        self.artist_lbl = QLabel()
         self.artist_lbl.setObjectName("meta")
         body.addWidget(self.artist_lbl)
 
-        if not s.minimal:
-            modes = " ".join(MODE_NAME.get(m, m) for m in s.modes)
-            stats = QLabel(f"\u266a {int(s.bpm)} BPM   \u00b7   \u23f1 {fmt_len(s.length)}"
-                           f"   \u00b7   {modes}")
-            stats.setObjectName("stats")
-            body.addWidget(stats)
+        self.stats_lbl = QLabel()
+        self.stats_lbl.setObjectName("stats")
+        body.addWidget(self.stats_lbl)
 
-            sub = QLabel(f"mapped by {elide(s.creator, 116, px=13)}   \u00b7   "
-                         f"\u25b6 {fmt_count(s.play_count)}   \u2665 {fmt_count(s.favourite_count)}")
-            sub.setObjectName("sub")
-            body.addWidget(sub)
-        else:
-            hint = QLabel("part of this pack")
-            hint.setObjectName("sub")
-            body.addWidget(hint)
+        self.sub_lbl = QLabel()
+        self.sub_lbl.setObjectName("sub")
+        body.addWidget(self.sub_lbl)
         root.addLayout(body)
+
+        self._in_pack = s.minimal     # this card belongs to a medal pack
+        self._fill_text(s)
 
         root.addStretch(1)
 
@@ -944,6 +950,52 @@ class BeatmapCard(QFrame):
 
         root.addLayout(btns)
         self.set_downloaded(downloaded)
+
+    def _fill_text(self, s: Beatmapset):
+        """Populate title / artist / stats / sub from a set. For a pack card with
+        no metadata yet, stats is blank and sub shows the pack hint."""
+        self._raw_title = s.title
+        self._raw_artist = s.artist
+        avail = max(self.width(), self.CARD_W) - 28
+        self.title_lbl.setText(elide(s.title, avail, bold=True, px=17))
+        self.title_lbl.setToolTip(f"{s.artist} - {s.title}" if s.artist else s.title)
+        self.artist_lbl.setText(elide(s.artist, avail, px=14))
+        if s.minimal:
+            self.stats_lbl.setText("")
+            self.sub_lbl.setText("part of this pack")
+            return
+        modes = " ".join(MODE_NAME.get(m, m) for m in s.modes)
+        self.stats_lbl.setText(f"\u266a {int(s.bpm)} BPM   \u00b7   \u23f1 {fmt_len(s.length)}"
+                               f"   \u00b7   {modes}")
+        sub = (f"mapped by {elide(s.creator, 116, px=13)}   \u00b7   "
+               f"\u25b6 {fmt_count(s.play_count)}   \u2665 {fmt_count(s.favourite_count)}")
+        if self._in_pack:
+            sub += "   \u00b7   in pack"
+        self.sub_lbl.setText(sub)
+
+    def apply_full(self, full: Beatmapset):
+        """Upgrade a minimal pack card in place once full metadata arrives:
+        real status colour, star badge, mapper and play/favourite stats."""
+        self.s = full
+        color = STATUS_COLORS.get(full.status, "#8a8a8a")
+        self.status_badge.setText(full.status or "?")
+        self.status_badge.setStyleSheet(
+            f"background:{color}; color:#15151a; border-radius:5px;"
+            "padding:2px 8px; font-size:11px; font-weight:700;")
+        self.status_badge.adjustSize()
+        self.status_badge.move(8, 8)
+
+        lo, hi = full.sr_range
+        self.sr_badge.setText(f"\u2605 {lo:.1f}" if abs(hi - lo) < 0.05
+                              else f"\u2605 {lo:.1f}\u2013{hi:.1f}")
+        self.sr_badge.adjustSize()
+        self.sr_badge.move(max(self.width(), self.CARD_W) - self.sr_badge.width() - 8, 8)
+        self.sr_badge.show()
+        self.sr_badge.raise_()
+        self.status_badge.raise_()
+
+        self._in_pack = True
+        self._fill_text(full)
 
     def set_downloaded(self, yes: bool):
         self.dl_btn.setEnabled(True)
@@ -1039,9 +1091,18 @@ class FilterBar(QWidget):
         logo = QLabel("\u25ce")          # hitcircle motif
         logo.setObjectName("logo")
         row1.addWidget(logo)
-        wordmark = QLabel("osu!<span style='color:#36e0ff'>dl</span>")
+        # Two-tone wordmark: last ~4 letters get the cyan accent. Falls back to a
+        # single colour for very short names. Driven entirely by APP_TITLE.
+        _t = APP_TITLE
+        if len(_t) > 4:
+            _head, _tail = _t[:-4], _t[-4:]
+            _markup = f"{_head}<span style='color:#36e0ff'>{_tail}</span>"
+        else:
+            _markup = _t
+        wordmark = QLabel(_markup)
         wordmark.setObjectName("wordmark")
         wordmark.setTextFormat(Qt.RichText)
+        wordmark.setToolTip(APP_TAGLINE)
         row1.addWidget(wordmark)
         row1.addSpacing(6)
 
@@ -1089,11 +1150,9 @@ class FilterBar(QWidget):
 
         row3 = QHBoxLayout()
         row3.setSpacing(14)
-        self.genre = self._combo(GENRES)
         self.bpm = self._combo(BPM_RANGES)
         self.stars = self._combo(STAR_RANGES)
         self.stars.setMinimumWidth(178)
-        row3.addWidget(self._labeled("Genre", self.genre))
         row3.addWidget(self._labeled("BPM", self.bpm))
         row3.addWidget(self._labeled("Stars", self.stars))
 
@@ -1117,7 +1176,7 @@ class FilterBar(QWidget):
         outer.addWidget(panel)
 
         # auto-search when dropdowns change (swallow the int arg they emit)
-        for c in (self.mode, self.status, self.sort, self.bpm, self.stars, self.search_in, self.genre):
+        for c in (self.mode, self.status, self.sort, self.bpm, self.stars, self.search_in):
             c.currentIndexChanged.connect(lambda *_: self.searchRequested.emit())
         self.hide_owned.stateChanged.connect(lambda *_: self.searchRequested.emit())
 
@@ -1165,7 +1224,6 @@ class FilterBar(QWidget):
             "sr_min": sr_lo,
             "sr_max": sr_hi,
             "option": self.search_in.currentData(),
-            "genre": self.genre.currentData(),
             "hide_owned": self.hide_owned.isChecked(),
             "no_video": self.no_video.isChecked(),
         }
@@ -1442,7 +1500,7 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("osu! Beatmap Downloader")
+        self.setWindowTitle(APP_TITLE)
         self.resize(1180, 820)
 
         self.settings = QSettings(ORG_NAME, APP_NAME)
@@ -1458,6 +1516,8 @@ class MainWindow(QMainWindow):
         self.pool = QThreadPool()              # search
         self.img_pool = QThreadPool()          # thumbnails
         self.img_pool.setMaxThreadCount(6)
+        self.meta_pool = QThreadPool()         # pack-card metadata enrichment
+        self.meta_pool.setMaxThreadCount(4)
         self.dl_pool = QThreadPool()           # downloads
         self.dl_pool.setMaxThreadCount(int(self.settings.value("concurrency", 3)))
 
@@ -1693,10 +1753,10 @@ class MainWindow(QMainWindow):
             added += 1
 
         total = len(self.cards)
-        # client-side-only filters (genre/bpm/stars) aren't applied by the mirror,
+        # client-side-only filters (BPM/stars) aren't applied by the mirror,
         # so a rare pick can be absent from the first pages. Keep pulling until the
         # grid has a usable number of matches (capped to avoid hammering the API).
-        client_filter = bool(f.get("genre") or f.get("bpm_min") or f.get("bpm_max")
+        client_filter = bool(f.get("bpm_min") or f.get("bpm_max")
                              or f.get("sr_min") or f.get("sr_max"))
         target = 24 if client_filter else 1
         cap = 20 if client_filter else 6
@@ -1748,6 +1808,12 @@ class MainWindow(QMainWindow):
             s = Beatmapset.from_pack(sid, name)
             owned = sid in self.downloaded_ids
             self._add_card(s, owned)
+            # best-effort enrich with full metadata (mapper, bpm, stars...) via search
+            if name:
+                w = Worker(fetch_set_meta, sid, name)
+                w.signals.result.connect(self._on_set_meta)
+                w.signals.error.connect(self._on_meta_error)
+                self.meta_pool.start(w)
         n = len(sets)
         have = sum(1 for sid, _ in sets if sid in self.downloaded_ids)
         self.pack_label.setText(
@@ -1755,6 +1821,20 @@ class MainWindow(QMainWindow):
             + (f"  ({have} already in library)" if have else ""))
         self.pack_dl_btn.setEnabled(True)
         self.status_label.setText(f"{n} maps in pack")
+
+    @Slot(object)
+    def _on_set_meta(self, payload):
+        """Apply fetched full metadata to the matching pack card (if still shown)."""
+        sid, full = payload
+        card = self.cards.get(sid)
+        if card is not None:
+            card.apply_full(full)
+
+    @Slot(str)
+    def _on_meta_error(self, msg):
+        # Best-effort enrichment: a map that doesn't surface in search just keeps
+        # its artist/title from the pack page. Nothing to surface to the user.
+        pass
 
     @Slot(str)
     def _on_pack_error(self, msg):
@@ -2230,10 +2310,31 @@ QSlider::handle:horizontal {
 """
 
 
+def resource_path(name: str) -> str:
+    """Path to a bundled resource, working both from source and from a
+    PyInstaller one-file build (which unpacks data into sys._MEIPASS)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
 def main():
+    # Make Windows show our own taskbar icon instead of grouping under python.exe.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                f"{ORG_NAME}.{APP_NAME}")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORG_NAME)
+
+    icon_file = resource_path("icon.ico")
+    if os.path.exists(icon_file):
+        app.setWindowIcon(QIcon(icon_file))
+
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
