@@ -1,8 +1,9 @@
 <div align="center">
 
-<img src="icon.png" width="96" alt="CircleWave icon">
-
 # CircleWave
+<!-- Drop a screenshot at docs/screenshot.png (e.g. the main grid or a medal pack) and it shows here. -->
+<img src="https://i.postimg.cc/m2GpZ4f4/Screenshot-20260618-193527.png" width="4096" alt="CircleWave screenshot">
+</div>
 
 **A synthwave-themed desktop browser & batch downloader for osu! beatmaps.**
 
@@ -12,7 +13,7 @@ single-file PySide6 app with a neon pink-and-cyan UI.
 
 [![Release](https://img.shields.io/github/v/release/AmarilloNL/CircleWave?color=ff66ab)](https://github.com/AmarilloNL/CircleWave/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/AmarilloNL/CircleWave/total?color=36e0ff)](https://github.com/AmarilloNL/CircleWave/releases)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/github/license/AmarilloNL/CircleWave)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 
 </div>
@@ -31,13 +32,6 @@ install, just download and run.
 
 **Linux / macOS:** run from source — see [below](#run-from-source). It's a single Python file with
 two dependencies, so it's a couple of commands on any distro.
-
-## Screenshots
-
-<div align="center">
-<!-- Drop a screenshot at docs/screenshot.png (e.g. the main grid or a medal pack) and it shows here. -->
-<img src="docs/screenshot.png" width="900" alt="CircleWave screenshot">
-</div>
 
 ## Features
 - **Synthwave / osu! UI** — neon pink-and-cyan theme on deep indigo, glowing search,
