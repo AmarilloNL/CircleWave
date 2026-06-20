@@ -40,9 +40,9 @@ two dependencies, so it's a couple of commands on any distro.
 - **Search** — title / artist / mapper / tags, with a **Search in** selector. To pull up a
   specific mapper's maps, set *Search in → Mapper* (a plain text search otherwise mixes in maps
   merely *tagged* with that name).
-- **Filters** — mode, status (ranked / loved / graveyard / ...), BPM range, star range
-  (including 7★/8★/9★/10★-and-up bands). Mode/status/sort/search-in are sent to the API; BPM and
-  star ranges are applied client-side, and the grid keeps auto-loading until it has enough matches.
+- **Filters** — mode, status, BPM range, length range, star range (incl. 7★/8★/9★/10★-and-up
+  bands), plus **genre** and **language**. Field-scoped (Artist/Title/Mapper) and genre/language
+  searches run against a complete mirror index for accurate, full results.
 - **Audio preview** — ▶ on any card streams the ~10s clip; volume slider + stop button in the status bar.
 - **Medal packs (osu!stable)** — the 🏅 *Medal packs* button lists every Beatmap Pack medal
   (pulled live from the osu! wiki). Pick one and it loads the pack's maps (with real artist / title /
@@ -51,6 +51,10 @@ two dependencies, so it's a couple of commands on any distro.
   (Browse / Auto-detect) or picked once and remembered; a `.bak` backup is written and existing
   collections are merged, not overwritten. Close osu! before it finishes, then reopen. *Stable only —
   lazer keeps collections in a Realm DB that can't be safely written from outside.*
+- **Beatmap packs** — the 📦 *Beatmap packs* button browses all ~3,750 official osu! packs across the
+  seven categories (Standard, Featured Artist, Tournament, Project Loved, Spotlights, Theme,
+  Artist/Album), with a game-mode filter and name search. Pick a pack and it loads exactly like a
+  medal pack: download every map and build a collection named after the pack.
 - **One folder** — a single location does double duty: maps download into it and it's scanned to
   mark what you already have (auto-detects osu-wine / lazer / Windows / macOS). Combined with a local
   history file, "✓ In library" / hide-owned works for lazer too and across machines.
@@ -123,19 +127,19 @@ the pip PySide6 wheels are arm64-native.
 > native backends and need nothing extra.
 
 ## Data source
-- Search and metadata come from **Nerinyan** (`https://api.nerinyan.moe`), an open, no-auth mirror
-  whose responses match the osu!-web beatmapset format. No account or API key needed.
-- Medal-pack maps are read from the public osu! pack pages; per-map details (mapper, BPM, stars) are
-  looked up through the same search.
-- Downloads use a mirror fallback cascade: **nerinyan → sayobot → catboy → beatconnect**.
-- Endpoints, mirror order, and the product name (`APP_TITLE`) all live near the top of `circlewave.py`.
+- **Search** uses the **Hinamizawa** mirror (`mirror.hinamizawa.ai`) — a complete, no-auth index
+  with clean relevance ranking, sort, pagination, and genre/language filters. It returns accurate,
+  full results (e.g. an artist's whole catalogue), unlike thinner mirrors that miss maps or can't
+  filter by artist. **Nerinyan** (`api.nerinyan.moe`) is the automatic fallback if it's unreachable.
+- BPM and play/favourite counts aren't in the mirror's search response, so visible cards enrich those
+  on demand from **osu.direct**. No account or API key needed for any of this.
+- **Downloads** cascade across several mirrors (Nerinyan, Sayobot, catboy.best, Beatconnect) so a map
+  that's slow or missing on one is fetched from another.
 
 ## Notes / limits
 - The folder scan reads osu!(stable)-style entries (`<setid> Artist - Title`); the local history
   file covers everything downloaded through the app, including lazer imports.
 - Sort options are the ones the mirror supports (ranked date, title, artist, plays, favourites, updated).
-- **No genre filter.** Genre metadata lives only behind osu!'s authenticated API, and the no-auth
-  mirrors don't expose it — so to keep CircleWave zero-setup, genre filtering isn't offered.
 
 ## License
 CircleWave is released under the **GNU General Public License v3.0** — see [LICENSE](LICENSE).
