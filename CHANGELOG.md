@@ -1,0 +1,57 @@
+# Changelog
+
+All notable changes to Circlewave are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
+follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.1.0] - 2026-06-20
+
+### Added
+- **Beatmap packs browser** — a new 📦 *Beatmap packs* button browses all ~3,750
+  official osu! packs across the seven categories (Standard, Featured Artist,
+  Tournament, Project Loved, Spotlights, Theme, Artist/Album), with a game-mode
+  filter, name search, and paging. Picking a pack downloads every map and builds a
+  collection named after the pack — the same flow as the medal packs.
+- **Genre and Language filters** for searches.
+- **BPM and play/favourite counts on cards**, enriched on demand from osu.direct
+  (the search backend doesn't include them).
+- **Sort directions** — Title A–Z/Z–A, Ranked newest/oldest, etc. now sort the way
+  the labels say.
+
+### Changed
+- **Search backend migrated to the Hinamizawa mirror** for a complete index and
+  clean, relevance-ranked results (it finds maps the previous backend was missing
+  and returns an artist's full catalogue). Nerinyan is now the automatic fallback,
+  and downloads still cascade across multiple mirrors.
+- **Default view is now Ranked · osu! · newest** instead of an empty-query grab-bag.
+- The **"Ranked" filter now includes approved maps**, matching the osu! website's
+  counts.
+- **Sayobot moved to the end of the download cascade** — it's China-hosted and slow
+  from outside CN, so it's now only a last resort.
+
+### Fixed
+- **"Any" status returned nothing** for text searches; it now spans every status.
+- **Status badges were wrong** (graveyard maps showed as "pending"); each card is
+  now tagged with the status it was actually queried under.
+- **Field-scoped searches** (Artist / Title / Mapper) returned incomplete results;
+  they now fetch by relevance so the whole catalogue surfaces, then sort for display.
+- **"In library" button styling** was inconsistent between preloaded-owned and
+  freshly-downloaded maps; both now show the same green outline.
+- **"No-video" toggle** only applied after a re-search; it's now read live at
+  download time.
+
+## [1.0.0] - Initial release
+
+### Added
+- Synthwave-themed PySide6 desktop app to browse and batch-download osu! beatmaps.
+- Filters: mode, status, sort, BPM range, length range, star range, and a
+  "Search in" field scope (Artist / Title / Mapper / Tags).
+- Lazy-loading grid with cover art, audio preview, and a bottom download dock with
+  a multi-mirror download cascade.
+- **Medal packs** — browse Beatmap Pack medals from the osu! wiki, download a whole
+  pack, and auto-build an osu!stable collection named after the medal.
+- "Already in library" detection and hide-owned, driven by your osu! Songs folder.
+- GPL-3.0 licensed; Windows `.exe` built via GitHub Actions.
+
+[1.1.0]: https://github.com/AmarilloNL/CircleWave/releases/tag/v1.1.0
+[1.0.0]: https://github.com/AmarilloNL/CircleWave/releases/tag/v1.0.0
