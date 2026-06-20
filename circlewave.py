@@ -7,6 +7,19 @@ A PySide6 desktop browser + batch downloader for osu! beatmaps, with a
 synthwave/neon look. Search the catalogue, preview audio, queue downloads with
 mirror fallback, and auto-build osu!stable collections from Beatmap Pack medals.
 
+Copyright (C) 2026 AmarilloNL
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, version 3.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program.  If not, see <https://www.gnu.org/licenses/>.
+
 Data source : Nerinyan (https://api.nerinyan.moe) osu!-web-compatible mirror API.
               No auth required. The actual .osz download falls back across
               nerinyan / sayobot / catboy / beatconnect.
@@ -83,11 +96,21 @@ except Exception:  # pragma: no cover
 # Branding. APP_TITLE is the one place to change the product name -- it drives
 # the window title and the header wordmark.
 APP_TITLE = "Circlewave"
+APP_VERSION = "1.1.0"
 APP_TAGLINE = "osu! beatmap browser & downloader"
 ORG_NAME = "AmarilloNL"
 APP_NAME = "Circlewave"
 
 NERINYAN_SEARCH = "https://api.nerinyan.moe/search"   # POST JSON body; returns osu!-web array
+# Hinamizawa mirror search: complete index (incl. maps Nerinyan lacks), clean
+# relevance, server-side genre/language/status/bpm/star filters. CheeseGull-style
+# response. No working pagination and no BPM/play-count fields -- so it's used for
+# field-scoped searches and genre/language filters, with Nerinyan for plain browse.
+HINA_SEARCH = "https://mirror.hinamizawa.ai/api/v1/hinai/search"
+HINA_AMOUNT = 100                # page size; paginates via the `offset` param
+# hinamizawa's search has no BPM / play counts; osu.direct returns full osu!-web
+# data for any set, so visible hinamizawa cards are enriched from it on demand.
+OSU_DIRECT_SET = "https://osu.direct/api/v2/s/{id}"
 PREVIEW_URL = "https://b.ppy.sh/preview/{id}.mp3"
 WEB_SET_URL = "https://osu.ppy.sh/beatmapsets/{id}"
 
@@ -96,8 +119,26 @@ WEB_SET_URL = "https://osu.ppy.sh/beatmapsets/{id}"
 MEDAL_WIKI_URL = ("https://raw.githubusercontent.com/ppy/osu-wiki/master/"
                   "wiki/Medals/Unlock_requirements/Beatmap_packs/en.md")
 PACK_PAGE_URL = "https://osu.ppy.sh/beatmaps/packs/{tag}"
+# Pack listing (newest first, 100 per page). Categories use osu!'s `type` values.
+PACK_LIST_URL = "https://osu.ppy.sh/beatmaps/packs?type={type}&page={page}"
+PACK_TYPES = [
+    ("Standard", "standard"), ("Featured Artist", "featured"),
+    ("Tournament", "tournament"), ("Project Loved", "loved"),
+    ("Spotlights", "chart"), ("Theme", "theme"), ("Artist/Album", "artist"),
+]
+PACK_PAGE_COUNT = 100          # packs per listing page
 
 PAGE_SIZE = 50
+# When a search is narrowed client-side (field scope, BPM / star / length range),
+# we pull a much bigger page so 1-2 requests gather enough matches instead of ~20
+# sequential 50-result pages. The mirror caps ps at 1000; only matched cards are
+# rendered, so the rest is just discarded JSON.
+FILTER_PAGE_SIZE = 250
+# Field-scoped searches (Search in -> Artist/Title/...) can't be filtered by the
+# server, so we fetch the whole bounded `q` result set in max-size pages and
+# filter locally. ps maxes at 1000 on the mirror; a few pages covers any artist.
+FIELD_SEARCH_PS = 1000
+FIELD_SEARCH_MAX_PAGES = 5
 HTTP_TIMEOUT = 30
 USER_AGENT = "osu-beatmap-downloader/1.0 (+personal use)"
 # Some mirrors (catboy, beatconnect) gate non-browser clients; use a browser UA
@@ -108,9 +149,10 @@ DOWNLOAD_UA = ("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox
 # {id} is substituted with the beatmapset id.
 MIRRORS = [
     {"name": "nerinyan",   "full": "https://api.nerinyan.moe/d/{id}",                      "novideo": "https://api.nerinyan.moe/d/{id}?noVideo=true"},
-    {"name": "sayobot",    "full": "https://dl.sayobot.cn/beatmaps/download/full/{id}",    "novideo": "https://dl.sayobot.cn/beatmaps/download/novideo/{id}"},
     {"name": "catboy",     "full": "https://catboy.best/d/{id}",                           "novideo": "https://catboy.best/d/{id}?n=1"},
     {"name": "beatconnect","full": "https://beatconnect.io/b/{id}",                        "novideo": None},
+    # Sayobot is China-hosted and slow/throttled from outside CN, so it's the last resort.
+    {"name": "sayobot",    "full": "https://dl.sayobot.cn/beatmaps/download/full/{id}",    "novideo": "https://dl.sayobot.cn/beatmaps/download/novideo/{id}"},
 ]
 
 MODES = [("Any", None), ("osu!", 0), ("taiko", 1), ("catch", 2), ("mania", 3)]
@@ -144,6 +186,40 @@ SEARCH_FIELDS = [
     ("Tags", "tag"),
 ]
 
+# osu! genre / language ids (used by the hinamizawa mirror's genre=/language= params).
+GENRES = [
+    ("Any genre", 0), ("Video Game", 2), ("Anime", 3), ("Rock", 4), ("Pop", 5),
+    ("Other", 6), ("Novelty", 7), ("Hip Hop", 9), ("Electronic", 10),
+    ("Metal", 11), ("Classical", 12), ("Folk", 13), ("Jazz", 14),
+    ("Unspecified", 1),
+]
+LANGUAGES = [
+    ("Any language", 0), ("English", 2), ("Japanese", 3), ("Chinese", 4),
+    ("Instrumental", 5), ("Korean", 6), ("French", 7), ("German", 8),
+    ("Swedish", 9), ("Spanish", 10), ("Italian", 11), ("Russian", 12),
+    ("Polish", 13), ("Other", 14), ("Unspecified", 1),
+]
+# Map our status strings <-> hinamizawa's numeric RankedStatus.
+# Map our status strings to hinamizawa numeric RankedStatus codes. "Ranked"
+# bundles ranked(1)+approved(2), matching how osu! and the mirror's own UI treat
+# it (sent as a comma list); "Any" omits the param.
+HINA_STATUS = {"all": [1, 2, 3, 4, 0, -1, -2],   # no "all" sentinel exists, so fan out
+               "ranked": [1, 2], "qualified": [3], "loved": [4],
+               "pending": [0], "wip": [-1], "graveyard": [-2]}
+# The mirror's response RankedStatus is coarse/unreliable (only 0/1), so we tag
+# each result with the status code we *queried* instead -- that's authoritative.
+HINA_CODE_STATUS = {1: "ranked", 2: "approved", 3: "qualified", 4: "loved",
+                    0: "pending", -1: "wip", -2: "graveyard"}
+HINA_STATUS_REV = {1: "ranked", 2: "approved", 3: "qualified", 4: "loved",
+                   0: "pending", -1: "wip", -2: "graveyard"}
+# Our sort keys -> the mirror's `sort` values (it has no asc/desc variants).
+HINA_SORT = {k: k for k in (        # the mirror takes "{field}_{asc|desc}" directly,
+    "ranked_desc", "ranked_asc",    # which is exactly our SORTS key format, so each
+    "title_asc", "title_desc",      # key passes through unchanged (real A-Z/Z-A and
+    "artist_asc",                   # newest/oldest). Unknown keys are dropped.
+    "plays_desc", "favourites_desc", "updated_desc")}
+HINA_MODE = {0: "osu", 1: "taiko", 2: "fruits", 3: "mania"}
+
 # Preset ranges for the BPM / Stars dropdowns. Each value is (min, max); 0 = open.
 BPM_RANGES = [
     ("Any BPM", (0, 0)),
@@ -153,6 +229,15 @@ BPM_RANGES = [
     ("180 \u2013 200", (180, 200)),
     ("200 \u2013 240", (200, 240)),
     ("240+", (240, 0)),
+]
+LENGTH_RANGES = [
+    ("Any length", (0, 0)),
+    ("Under 1 min", (0, 60)),
+    ("1 \u2013 2 min", (60, 120)),
+    ("2 \u2013 3 min", (120, 180)),
+    ("3 \u2013 5 min", (180, 300)),
+    ("5 \u2013 7 min", (300, 420)),
+    ("Over 7 min", (420, 0)),
 ]
 STAR_RANGES = [
     ("Any difficulty", (0, 0)),
@@ -200,6 +285,7 @@ class Beatmapset:
     cover_url: str
     diffs: list = field(default_factory=list)
     minimal: bool = False   # built from a pack page (id + name only)
+    tags: str = ""
 
     @property
     def sr_range(self) -> tuple:
@@ -253,6 +339,34 @@ class Beatmapset:
             favourite_count=int(js.get("favourite_count", 0) or 0),
             cover_url=cover,
             diffs=diffs,
+            tags=str(js.get("tags", "") or ""),
+        )
+
+    @classmethod
+    def from_hinai(cls, js: dict) -> "Beatmapset":
+        """Parse the hinamizawa mirror's CheeseGull-style set object. It carries
+        no BPM or play/favourite counts, so those stay 0 (cards adapt)."""
+        sid = int(js.get("SetID", 0) or 0)
+        diffs = []
+        for b in js.get("ChildrenBeatmaps", []) or []:
+            diffs.append(Diff(
+                mode=HINA_MODE.get(int(b.get("Mode", 0) or 0), "osu"),
+                sr=float(b.get("DifficultyRating", 0) or 0),
+                bpm=0.0,
+                length=int(b.get("TotalLength", 0) or 0),
+                version=b.get("DiffName", ""),
+            ))
+        diffs.sort(key=lambda d: d.sr)
+        variant = "card" + "@2x.jpg"
+        return cls(
+            id=sid,
+            title=js.get("Title", "(unknown)"),
+            artist=js.get("Artist", ""),
+            creator=js.get("Creator", ""),
+            status=HINA_STATUS_REV.get(int(js.get("RankedStatus", 0) or 0), ""),
+            bpm=0.0, play_count=0, favourite_count=0,
+            cover_url=f"https://assets.ppy.sh/beatmaps/{sid}/covers/{variant}",
+            diffs=diffs, tags="",
         )
 
     @classmethod
@@ -273,10 +387,49 @@ class Beatmapset:
 # ----------------------------------------------------------------------------
 # API CLIENT
 # ----------------------------------------------------------------------------
+def _field_rank(value: str, query: str) -> int:
+    """Match quality of `query` against a field `value`, lower = closer:
+      0  exact            (artist == "xi")
+      1  field starts with the whole query   ("xi feat. ...")
+      2  query tokens are whole words in the field
+      3  loose: each token only prefixes some word ("xi" -> "xiao")
+     -1  no match
+    Used to order field-scoped results so the exact artist leads and incidental
+    matches (a word merely starting with the query) sink to the end."""
+    v = (value or "").lower().strip()
+    q = query.lower().strip()
+    if not q or v == q:
+        return 0
+    if v.startswith(q):
+        return 1
+    vwords = re.findall(r"[0-9a-z]+", v)
+    qtoks = re.findall(r"[0-9a-z]+", q)
+    if not qtoks:
+        return 0
+    if all(t in vwords for t in qtoks):
+        return 2
+    if all(any(w.startswith(t) for w in vwords) for t in qtoks):
+        return 3
+    return -1
+
+
+def _field_match(value: str, query: str) -> bool:
+    """True if `query` matches `value` at all (any quality tier)."""
+    return _field_rank(value, query) >= 0
+
+
+_FIELD_GETTERS = {
+    "title": lambda s: s.title,
+    "artist": lambda s: s.artist,
+    "creator": lambda s: s.creator,
+    "tag": lambda s: s.tags,
+}
+
+
 def passes_range(s: "Beatmapset", f: dict) -> bool:
-    """Client-side BPM / star-rating range filter (Nerinyan's GET API has no
-    query param for these). A set matches if ANY of its difficulties falls in
-    range -- same semantics as the site's server-side filter."""
+    """Client-side BPM / star-rating / length range filter (Nerinyan's GET API
+    has no query param for these). A set matches if ANY of its difficulties falls
+    in range -- same semantics as the site's server-side filter."""
     if f["bpm_min"] or f["bpm_max"]:
         bpms = [d.bpm for d in s.diffs if d.bpm] or ([s.bpm] if s.bpm else [])
         if bpms:
@@ -294,40 +447,212 @@ def passes_range(s: "Beatmapset", f: dict) -> bool:
             return False
         if f["sr_max"] and min(srs) > f["sr_max"]:
             return False
+    if f.get("len_min") or f.get("len_max"):
+        lengths = [d.length for d in s.diffs if d.length]
+        if lengths:                      # keep sets with no length data
+            if f.get("len_min") and max(lengths) < f["len_min"]:
+                return False
+            if f.get("len_max") and min(lengths) > f["len_max"]:
+                return False
     return True
 
 
-def search_beatmapsets(filters: dict, token) -> tuple:
-    """Query Nerinyan (GET) and return (list[Beatmapset], next_token|None).
+def _has_client_filter(f: dict) -> bool:
+    """Whether this search is narrowed in the client (BPM / star / length range,
+    or a 'Search in' field scope) and therefore benefits from the larger page."""
+    return bool(f.get("bpm_min") or f.get("bpm_max") or f.get("sr_min")
+                or f.get("sr_max") or f.get("len_min") or f.get("len_max")
+                or (f.get("option") and (f.get("q") or "").strip()))
 
-    Uses Nerinyan's query-param interface (q/m/s/sort/p/ps). BPM/star ranges
-    aren't query params on that API, so they're applied client-side here.
-    Pagination is page-based: `token` is None on the first page, then the next
-    page index returned here.
-    """
-    page = 0 if token is None else int(token)
-    params = {
-        "q": filters["q"].strip(),
-        "s": "all" if filters["status"] in (None, "", "any") else filters["status"],
-        "sort": filters["sort"],
-        "p": page,
-        "ps": PAGE_SIZE,
-    }
-    if filters["mode"] is not None:
-        params["m"] = filters["mode"]
-    if filters.get("option"):
-        params["option"] = filters["option"]   # restrict text match to one field
 
+def _fetch_search_page(base: dict, page: int, ps: int) -> list:
+    params = dict(base, p=page, ps=ps)
     r = requests.get(NERINYAN_SEARCH, params=params,
                      headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     data = r.json()
-    raw = data if isinstance(data, list) else data.get("beatmapsets", [])
-    sets = [Beatmapset.from_json(s) for s in raw]
-    if any(filters.get(k) for k in ("bpm_min", "bpm_max", "sr_min", "sr_max")):
+    return data if isinstance(data, list) else data.get("beatmapsets", [])
+
+
+def fetch_card_meta(set_id: int) -> tuple:
+    """Fetch full osu!-web metadata for one set from osu.direct (BPM, play and
+    favourite counts, accurate per-diff data) to enrich a hinamizawa card.
+    Returns (set_id, Beatmapset)."""
+    r = requests.get(OSU_DIRECT_SET.format(id=set_id),
+                     headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if not isinstance(data, dict) or not data.get("id"):
+        raise RuntimeError(f"no metadata for set {set_id}")
+    return set_id, Beatmapset.from_json(data)
+
+
+def search_beatmapsets(filters: dict, token) -> tuple:
+    """Search via the hinamizawa mirror (complete index, clean relevance, genre/
+    language/sort/status filters), falling back to Nerinyan only if it errors so
+    the app keeps working."""
+    try:
+        return _search_hinamizawa(filters, token)
+    except Exception:
+        if token is None:                  # fall back only on a fresh search; a
+            return _search_nerinyan(filters, None)   # paging token isn't portable
+        return [], None
+
+
+def _hina_get(params: dict, status_code=None) -> list:
+    """Fetch one page and parse to Beatmapsets. If a status_code is given, it's
+    sent as the `status` filter AND used to tag each result (the response's
+    RankedStatus field is unreliable, so the queried code is authoritative)."""
+    if status_code is not None:
+        params = dict(params, status=status_code)
+    r = requests.get(HINA_SEARCH, params=params,
+                     headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    raw = data if isinstance(data, list) else []
+    sets = [Beatmapset.from_hinai(s) for s in raw]
+    if status_code is not None:
+        label = HINA_CODE_STATUS.get(status_code, "")
+        for s in sets:
+            s.status = label
+    return sets
+
+
+def _client_sort(sets: list, sort_key: str) -> list:
+    """Sort a field-scoped result set locally. Only title/artist are reliably
+    sortable here (play counts/dates aren't in the response), so other sorts keep
+    the relevance/exactness order they already have."""
+    if sort_key == "title_asc":
+        return sorted(sets, key=lambda s: s.title.lower())
+    if sort_key == "title_desc":
+        return sorted(sets, key=lambda s: s.title.lower(), reverse=True)
+    if sort_key == "artist_asc":
+        return sorted(sets, key=lambda s: s.artist.lower())
+    return sets
+
+
+def _search_hinamizawa(filters: dict, token) -> tuple:
+    """Query the hinamizawa mirror and return (list[Beatmapset], next_token|None).
+
+    The mirror has no "all statuses" option and returns nothing for a text search
+    with no status, so "Any" fans out across every status code and merges. Each
+    result is tagged with the status we *queried* (its RankedStatus field only
+    reports 0/1). Field-scoped searches (Artist/Title/Mapper) are fetched by
+    relevance so the whole catalogue surfaces, then sorted locally for display;
+    browses page server-side via `offset`. BPM/play counts aren't in the response
+    (cards enrich those from osu.direct), so BPM ranges filter server-side and
+    stars/length filter locally.
+    """
+    offset = 0 if token is None else int(token)
+    q = filters["q"].strip()
+    base = {"query": q, "amount": HINA_AMOUNT}
+    if filters.get("mode") is not None:
+        base["mode"] = filters["mode"]
+    if filters.get("genre"):
+        base["genre"] = filters["genre"]
+    if filters.get("language"):
+        base["language"] = filters["language"]
+    if filters.get("bpm_min"):                       # bpm not in the response, so
+        base["min_bpm"] = filters["bpm_min"]         # ranges filter server-side
+    if filters.get("bpm_max"):
+        base["max_bpm"] = filters["bpm_max"]
+
+    codes = HINA_STATUS.get(filters.get("status")) or [1]   # default to ranked-tier
+    getter = _FIELD_GETTERS.get(filters.get("option") or "")
+    field_scope = bool(q and getter and filters.get("option") != "tag")
+
+    if field_scope:
+        # Fetch every requested status by relevance (no sort, no paging) so the
+        # artist's full catalogue clusters in; merge, keep matches, sort locally.
+        sets, have = [], set()
+        for c in codes:
+            for s in _hina_get(dict(base), c):
+                if s.id not in have:
+                    have.add(s.id)
+                    sets.append(s)
+        ranked = [(rk, s) for s in sets
+                  for rk in (_field_rank(getter(s), q),) if rk >= 0]
+        ranked.sort(key=lambda t: t[0])
+        sets = _client_sort([s for _, s in ranked], filters.get("sort"))
+        next_token = None
+    else:
+        # Browse: the primary status code paginates via offset; any extra codes
+        # (e.g. approved under "Ranked", or all of them under "Any") merge on page 1.
+        sort = HINA_SORT.get(filters.get("sort"))
+        if sort:
+            base["sort"] = sort
+        raw = _hina_get(dict(base, offset=offset), codes[0])
+        sets, have = list(raw), {s.id for s in raw}
+        if len(codes) > 1 and offset == 0:
+            for c in codes[1:]:
+                for s in _hina_get(dict(base), c):
+                    if s.id not in have:
+                        have.add(s.id)
+                        sets.append(s)
+        next_token = offset + HINA_AMOUNT if len(raw) >= HINA_AMOUNT else None
+
+    # stars + length client-side (bpm is filtered server-side; bpm fields are 0)
+    if any(filters.get(k) for k in ("sr_min", "sr_max", "len_min", "len_max")):
         sets = [s for s in sets if passes_range(s, filters)]
-    # Pagination tracks the raw page size, not the post-filter count.
-    next_token = page + 1 if len(raw) >= PAGE_SIZE else None
+    return sets, next_token
+
+
+def _search_nerinyan(filters: dict, token) -> tuple:
+    """Fallback backend (Nerinyan, GET) -> (list[Beatmapset], next_token|None).
+
+    Used only when the hinamizawa mirror is unreachable. The deployed mirror
+    ignores the per-field `option` param (it silently disables text filtering),
+    so a "Search in" field scope is done client-side. An artist's maps are
+    scattered through a noisy `q` result by title, so for a field-scoped search we
+    pull the *whole* (bounded) `q` result set in max-size pages and filter + rank
+    locally. BPM/star/length ranges have no query param either and are applied here.
+    """
+    base = {
+        "q": filters["q"].strip(),
+        "s": "all" if filters["status"] in (None, "", "any") else filters["status"],
+        "sort": filters["sort"],
+    }
+    if filters["mode"] is not None:
+        base["m"] = filters["mode"]
+
+    q = filters["q"].strip()
+    getter = _FIELD_GETTERS.get(filters.get("option") or "")
+    range_filter = any(filters.get(k) for k in ("bpm_min", "bpm_max", "sr_min",
+                                                "sr_max", "len_min", "len_max"))
+
+    if q and getter:
+        # Pull the full result set for this query (capped), tolerating the server
+        # clamping `ps` to its own max -- we detect the real page size and stop at
+        # the last (short) page rather than assuming a fixed size.
+        raw, page_size = [], None
+        for p in range(FIELD_SEARCH_MAX_PAGES):
+            page = _fetch_search_page(base, p, FIELD_SEARCH_PS)
+            if not page:
+                break
+            raw.extend(page)
+            if page_size is None:
+                page_size = len(page)
+            if len(page) < page_size:      # last, partial page
+                break
+        sets = [Beatmapset.from_json(s) for s in raw]
+        ranked = [(r, s) for s in sets for r in (_field_rank(getter(s), q),) if r >= 0]
+        ranked.sort(key=lambda t: t[0])    # stable: keeps the chosen sort within a tier
+        sets = [s for _, s in ranked]
+        if range_filter:
+            sets = [s for s in sets if passes_range(s, filters)]
+        return sets, None                  # complete set; no further paging
+
+    # Non-field search: one page at a time (range filters use a bigger page so a
+    # rare match isn't stranded), with normal scroll pagination.
+    page = 0 if token is None else int(token)
+    ps = FILTER_PAGE_SIZE if range_filter else PAGE_SIZE
+    raw = _fetch_search_page(base, page, ps)
+    sets = [Beatmapset.from_json(s) for s in raw]
+    if range_filter:
+        sets = [s for s in sets if passes_range(s, filters)]
+    next_token = page + 1 if len(raw) >= ps else None
     return sets, next_token
 
 
@@ -567,6 +892,52 @@ def parse_pack_page(html_text: str) -> list:
             seen.add(sid)
             out.append((sid, ""))
     return out
+
+
+_PACK_LIST_RE = re.compile(
+    r'data-pack-tag="([^"]+)"\s*>\s*<a[^>]*class="beatmap-pack__header[^"]*"[^>]*>\s*'
+    r'<div class="beatmap-pack__name">([^<]*)</div>\s*'
+    r'<div class="beatmap-pack__details">\s*'
+    r'<span class="beatmap-pack__date">([^<]*)</span>', re.S)
+_PACK_LIST_FALLBACK_RE = re.compile(
+    r'data-pack-tag="([^"]+)".*?beatmap-pack__name">([^<]*)<', re.S)
+
+
+def _pack_mode(name: str) -> str:
+    """Best-effort game mode from a pack name (the Standard category mixes modes,
+    e.g. 'osu!taiko Beatmap Pack #410'). '' when the name gives no hint."""
+    n = name.lower()
+    if "osu!taiko" in n:
+        return "taiko"
+    if "osu!catch" in n or "osu!fruits" in n:
+        return "fruits"
+    if "osu!mania" in n:
+        return "mania"
+    if "osu!" in n:
+        return "osu"
+    return ""
+
+
+def parse_pack_list(html_text: str) -> list:
+    """Parse a pack listing page into [{'tag','name','date','mode'}, ...]."""
+    import html as _html
+    out = []
+    for tag, name, date in _PACK_LIST_RE.findall(html_text):
+        nm = _html.unescape(name.strip())
+        out.append({"tag": tag, "name": nm, "date": date.strip(), "mode": _pack_mode(nm)})
+    if not out:                                   # markup changed: tag + name only
+        for tag, name in _PACK_LIST_FALLBACK_RE.findall(html_text):
+            nm = _html.unescape(name.strip())
+            out.append({"tag": tag, "name": nm, "date": "", "mode": _pack_mode(nm)})
+    return out
+
+
+def fetch_pack_list(pack_type: str, page: int) -> list:
+    """Fetch one listing page (100 packs, newest first). Empty list = past the end."""
+    url = PACK_LIST_URL.format(type=pack_type, page=page)
+    r = requests.get(url, headers={"User-Agent": DOWNLOAD_UA}, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return parse_pack_list(r.text)
 
 
 def fetch_pack_medals() -> list:
@@ -965,10 +1336,18 @@ class BeatmapCard(QFrame):
             self.sub_lbl.setText("part of this pack")
             return
         modes = " ".join(MODE_NAME.get(m, m) for m in s.modes)
-        self.stats_lbl.setText(f"\u266a {int(s.bpm)} BPM   \u00b7   \u23f1 {fmt_len(s.length)}"
-                               f"   \u00b7   {modes}")
-        sub = (f"mapped by {elide(s.creator, 116, px=13)}   \u00b7   "
-               f"\u25b6 {fmt_count(s.play_count)}   \u2665 {fmt_count(s.favourite_count)}")
+        stats = []
+        if s.bpm:                              # hinamizawa results carry no BPM
+            stats.append(f"\u266a {int(s.bpm)} BPM")
+        if s.length:
+            stats.append(f"\u23f1 {fmt_len(s.length)}")
+        if modes:
+            stats.append(modes)
+        self.stats_lbl.setText("   \u00b7   ".join(stats))
+        sub = f"mapped by {elide(s.creator, 116, px=13)}"
+        if s.play_count or s.favourite_count:  # absent on hinamizawa
+            sub += (f"   \u00b7   \u25b6 {fmt_count(s.play_count)}"
+                    f"   \u2665 {fmt_count(s.favourite_count)}")
         if self._in_pack:
             sub += "   \u00b7   in pack"
         self.sub_lbl.setText(sub)
@@ -1001,8 +1380,13 @@ class BeatmapCard(QFrame):
         self.dl_btn.setEnabled(True)
         self.dl_btn.setText("\u2713 In library" if yes else "Download")
         self.setProperty("owned", yes)
-        self.style().unpolish(self)
-        self.style().polish(self)
+        # Re-polish the button too: the green "In library" style comes from the
+        # `#card[owned="true"] #dlbtn` descendant rule, and re-polishing only the
+        # card doesn't refresh the child, so a freshly downloaded map would keep
+        # its pink button. Polishing both keeps every in-library button identical.
+        for w in (self, self.dl_btn):
+            w.style().unpolish(w)
+            w.style().polish(w)
 
     def mark_queued(self):
         self.dl_btn.setEnabled(False)
@@ -1078,6 +1462,7 @@ def apply_glow(widget, hexcolor="#ff66ab", radius=22, alpha=150):
 class FilterBar(QWidget):
     searchRequested = Signal()
     medalPacksRequested = Signal()
+    beatmapPacksRequested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -1124,6 +1509,12 @@ class FilterBar(QWidget):
         self.medals_btn.setToolTip("Browse Beatmap Pack medals and grab a whole pack")
         self.medals_btn.clicked.connect(self.medalPacksRequested.emit)
         row1.addWidget(self.medals_btn)
+
+        self.packs_btn = QPushButton("\U0001F4E6  Beatmap packs")
+        self.packs_btn.setObjectName("medalbtn")
+        self.packs_btn.setToolTip("Browse all osu! beatmap packs by category and mode")
+        self.packs_btn.clicked.connect(self.beatmapPacksRequested.emit)
+        row1.addWidget(self.packs_btn)
         outer.addLayout(row1)
 
         # filters live in a distinct surface panel so they read as real controls
@@ -1151,10 +1542,16 @@ class FilterBar(QWidget):
         row3 = QHBoxLayout()
         row3.setSpacing(14)
         self.bpm = self._combo(BPM_RANGES)
+        self.length = self._combo(LENGTH_RANGES)
         self.stars = self._combo(STAR_RANGES)
         self.stars.setMinimumWidth(178)
+        self.genre = self._combo(GENRES)
+        self.language = self._combo(LANGUAGES)
         row3.addWidget(self._labeled("BPM", self.bpm))
+        row3.addWidget(self._labeled("Length", self.length))
         row3.addWidget(self._labeled("Stars", self.stars))
+        row3.addWidget(self._labeled("Genre", self.genre))
+        row3.addWidget(self._labeled("Language", self.language))
 
         toggles = QWidget()
         toggles.setObjectName("togglebox")
@@ -1176,14 +1573,15 @@ class FilterBar(QWidget):
         outer.addWidget(panel)
 
         # auto-search when dropdowns change (swallow the int arg they emit)
-        for c in (self.mode, self.status, self.sort, self.bpm, self.stars, self.search_in):
+        for c in (self.mode, self.status, self.sort, self.bpm, self.length,
+                  self.stars, self.genre, self.language, self.search_in):
             c.currentIndexChanged.connect(lambda *_: self.searchRequested.emit())
         self.hide_owned.stateChanged.connect(lambda *_: self.searchRequested.emit())
 
-        # sensible defaults: osu! standard, any status, alphabetical by title
-        self.mode.setCurrentIndex(max(0, self.mode.findData(0)))
-        self.status.setCurrentIndex(0)                      # "Any"
-        self.sort.setCurrentIndex(max(0, self.sort.findData("title_asc")))
+        # sensible defaults: ranked osu! standard maps, newest first
+        self.mode.setCurrentIndex(max(0, self.mode.findData(0)))         # osu!
+        self.status.setCurrentIndex(max(0, self.status.findData("ranked")))
+        self.sort.setCurrentIndex(max(0, self.sort.findData("ranked_desc")))  # newest
 
     # -- builders -----------------------------------------------------------
     def _eyebrow(self, text):
@@ -1214,6 +1612,7 @@ class FilterBar(QWidget):
     def filters(self) -> dict:
         bpm_lo, bpm_hi = self.bpm.currentData()
         sr_lo, sr_hi = self.stars.currentData()
+        len_lo, len_hi = self.length.currentData()
         return {
             "q": self.query.text(),
             "mode": self.mode.currentData(),
@@ -1223,6 +1622,10 @@ class FilterBar(QWidget):
             "bpm_max": bpm_hi,
             "sr_min": sr_lo,
             "sr_max": sr_hi,
+            "len_min": len_lo,
+            "len_max": len_hi,
+            "genre": self.genre.currentData() or 0,
+            "language": self.language.currentData() or 0,
             "option": self.search_in.currentData(),
             "hide_owned": self.hide_owned.isChecked(),
             "no_video": self.no_video.isChecked(),
@@ -1380,6 +1783,134 @@ class MedalPacksDialog(QDialog):
             self.accept()
 
 
+class BeatmapPacksDialog(QDialog):
+    """Browse all osu! beatmap packs by category/mode and pick one to load."""
+    def __init__(self, pool: QThreadPool, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Beatmap packs")
+        self.resize(560, 660)
+        self.pool = pool
+        self.chosen = None
+        self.packs = []            # everything loaded for the current category
+        self.page = 0
+        self.loading = False
+        self.has_more = True
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(10)
+        head = QLabel("Browse osu! beatmap packs. Pick one to load its maps \u2014 then "
+                      "download them all and build a collection named after the pack.")
+        head.setObjectName("hint")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.cat = QComboBox()
+        for label, val in PACK_TYPES:
+            self.cat.addItem(label, val)
+        self.cat.currentIndexChanged.connect(self._reload)
+        self.mode = QComboBox()
+        for label, val in [("All modes", ""), ("osu!", "osu"), ("osu!taiko", "taiko"),
+                           ("osu!catch", "fruits"), ("osu!mania", "mania")]:
+            self.mode.addItem(label, val)
+        self.mode.currentIndexChanged.connect(lambda *_: self._filter())
+        row.addWidget(self.cat, 1)
+        row.addWidget(self.mode, 1)
+        lay.addLayout(row)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Filter loaded packs by name\u2026")
+        self.search.textChanged.connect(lambda *_: self._filter())
+        lay.addWidget(self.search)
+
+        self.list = QListWidget()
+        self.list.itemDoubleClicked.connect(lambda *_: self._accept())
+        self.list.itemSelectionChanged.connect(
+            lambda: self.load_btn.setEnabled(self.list.currentItem() is not None))
+        lay.addWidget(self.list, 1)
+
+        self.status = QLabel("Loading packs\u2026")
+        self.status.setObjectName("hint")
+        lay.addWidget(self.status)
+
+        btns = QHBoxLayout()
+        self.more_btn = QPushButton("Load more")
+        self.more_btn.setObjectName("smallbtn")
+        self.more_btn.setEnabled(False)
+        self.more_btn.clicked.connect(self._load_next)
+        btns.addWidget(self.more_btn)
+        btns.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("smallbtn")
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(cancel)
+        self.load_btn = QPushButton("Load pack")
+        self.load_btn.setObjectName("primary")
+        self.load_btn.setEnabled(False)
+        self.load_btn.clicked.connect(self._accept)
+        btns.addWidget(self.load_btn)
+        lay.addLayout(btns)
+
+        self._reload()
+
+    def _reload(self, *_):
+        self.packs = []
+        self.page = 0
+        self.has_more = True
+        self.list.clear()
+        self._load_next()
+
+    def _load_next(self):
+        if self.loading or not self.has_more:
+            return
+        self.loading = True
+        self.more_btn.setEnabled(False)
+        self.status.setText("Loading packs\u2026")
+        self.page += 1
+        w = Worker(fetch_pack_list, self.cat.currentData(), self.page)
+        w.signals.result.connect(self._loaded)
+        w.signals.error.connect(self._failed)
+        self.pool.start(w)
+
+    def _loaded(self, packs):
+        self.loading = False
+        if len(packs) < PACK_PAGE_COUNT:
+            self.has_more = False
+        self.packs.extend(packs)
+        self._filter()
+        self.more_btn.setEnabled(self.has_more)
+
+    def _failed(self, err):
+        self.loading = False
+        self.status.setText(f"Couldn't load packs: {err}")
+
+    def _filter(self, *_):
+        text = self.search.text().lower().strip()
+        mode = self.mode.currentData()
+        self.list.clear()
+        shown = 0
+        for p in self.packs:
+            if text and text not in p["name"].lower():
+                continue
+            if mode and p["mode"] != mode:
+                continue
+            label = p["name"] + (f"     \u00b7  {p['date']}" if p["date"] else "")
+            it = QListWidgetItem(label)
+            it.setData(Qt.UserRole, p)
+            self.list.addItem(it)
+            shown += 1
+        tail = "" if self.has_more else "  \u00b7 end"
+        self.status.setText(f"{shown} shown \u00b7 {len(self.packs)} loaded{tail}")
+
+    def _accept(self):
+        it = self.list.currentItem()
+        if it is not None and it.data(Qt.UserRole) is not None:
+            self.chosen = it.data(Qt.UserRole)
+            self.accept()
+
+
 # ----------------------------------------------------------------------------
 # SETTINGS DIALOG
 # ----------------------------------------------------------------------------
@@ -1500,7 +2031,7 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_TITLE)
+        self.setWindowTitle(f"{APP_TITLE} {APP_VERSION}")
         self.resize(1180, 820)
 
         self.settings = QSettings(ORG_NAME, APP_NAME)
@@ -1515,7 +2046,7 @@ class MainWindow(QMainWindow):
 
         self.pool = QThreadPool()              # search
         self.img_pool = QThreadPool()          # thumbnails
-        self.img_pool.setMaxThreadCount(6)
+        self.img_pool.setMaxThreadCount(8)
         self.meta_pool = QThreadPool()         # pack-card metadata enrichment
         self.meta_pool.setMaxThreadCount(4)
         self.dl_pool = QThreadPool()           # downloads
@@ -1526,6 +2057,8 @@ class MainWindow(QMainWindow):
         self.loading = False
         self.cur_filters = None
         self.cards = {}            # setid -> BeatmapCard
+        self._cover_requested = set()   # setids whose cover load has started (lazy)
+        self._bpm_requested = set()     # hinamizawa setids whose BPM enrich started
         self.dl_rows = {}          # setid -> DownloadRow
         self.dl_workers = {}       # setid -> active DownloadWorker
         self.dl_pending = []       # list[Beatmapset] waiting for a free slot
@@ -1555,6 +2088,7 @@ class MainWindow(QMainWindow):
         self.filter_bar = FilterBar()
         self.filter_bar.searchRequested.connect(self.new_search)
         self.filter_bar.medalPacksRequested.connect(self._open_medal_packs)
+        self.filter_bar.beatmapPacksRequested.connect(self._open_beatmap_packs)
         root.addWidget(self.filter_bar)
 
         rule = QFrame()
@@ -1702,6 +2236,8 @@ class MainWindow(QMainWindow):
             if w:
                 w.deleteLater()
         self.cards.clear()
+        self._cover_requested.clear()
+        self._bpm_requested.clear()
 
     def _add_card(self, s, owned):
         card = BeatmapCard(s, owned)
@@ -1709,7 +2245,10 @@ class MainWindow(QMainWindow):
         card.downloadRequested.connect(self.enqueue_download)
         self.flow.addWidget(card)
         self.cards[s.id] = card
-        self._load_cover(s)
+        # Covers are loaded lazily for cards near the viewport (see
+        # _load_visible_covers); a big artist result no longer fires dozens of
+        # thumbnail downloads at once. Schedule a scan once layout settles.
+        QTimer.singleShot(0, self._load_visible_covers)
         return card
 
     def new_search(self):
@@ -1753,13 +2292,12 @@ class MainWindow(QMainWindow):
             added += 1
 
         total = len(self.cards)
-        # client-side-only filters (BPM/stars) aren't applied by the mirror,
-        # so a rare pick can be absent from the first pages. Keep pulling until the
-        # grid has a usable number of matches (capped to avoid hammering the API).
-        client_filter = bool(f.get("bpm_min") or f.get("bpm_max")
-                             or f.get("sr_min") or f.get("sr_max"))
+        # client-side-only filters (BPM / stars / length / field scope) aren't
+        # applied by the mirror, so a rare pick can be sparse on the first page.
+        # We now pull big pages (FILTER_PAGE_SIZE), so a handful of pages is plenty.
+        client_filter = _has_client_filter(f)
         target = 24 if client_filter else 1
-        cap = 20 if client_filter else 6
+        cap = 5 if client_filter else 6
 
         if self.more and total < target and self.auto_pages < cap:
             self.auto_pages += 1
@@ -1782,6 +2320,13 @@ class MainWindow(QMainWindow):
         dlg = MedalPacksDialog(self.pool, self)
         if dlg.exec() and dlg.chosen:
             self._enter_pack_mode(dlg.chosen)
+
+    def _open_beatmap_packs(self):
+        dlg = BeatmapPacksDialog(self.pool, self)
+        if dlg.exec() and dlg.chosen:
+            p = dlg.chosen
+            # reuse pack mode: one tag, collection named after the pack
+            self._enter_pack_mode({"medal": p["name"], "tags": [p["tag"]]})
 
     def _enter_pack_mode(self, medal: dict):
         self.pack = {"medal": medal["medal"], "tags": medal["tags"],
@@ -1935,8 +2480,54 @@ class MainWindow(QMainWindow):
         if value >= bar.maximum() - 400 and self.more and not self.loading:
             self.auto_pages = 0
             self._fetch_page()
+        self._load_visible_covers()
 
     # -- covers -------------------------------------------------------------
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._load_visible_covers)   # newly-visible cards
+
+    def _load_visible_covers(self):
+        """Start cover downloads only for cards in (or near) the viewport, so a
+        large result set doesn't queue dozens of thumbnails up front."""
+        bar = self.scroll.verticalScrollBar()
+        top = bar.value()
+        bottom = top + self.scroll.viewport().height()
+        margin = 700                       # preload a screenful above/below
+        for sid, card in self.cards.items():
+            if sid in self._cover_requested:
+                continue
+            if not card.s.cover_url:
+                self._cover_requested.add(sid)
+                continue
+            y = card.y()
+            if y + card.height() >= top - margin and y <= bottom + margin:
+                self._cover_requested.add(sid)
+                self._load_cover(card.s)
+                # hinamizawa cards have no BPM/play counts -> enrich visible ones
+                # from osu.direct. (Pack cards enrich via their own path.)
+                if (sid not in self._bpm_requested and not card._in_pack
+                        and not card.s.minimal and not card.s.bpm):
+                    self._bpm_requested.add(sid)
+                    w = Worker(fetch_card_meta, sid)
+                    w.signals.result.connect(self._on_card_meta)
+                    w.signals.error.connect(self._on_meta_error)
+                    self.meta_pool.start(w)
+
+    @Slot(object)
+    def _on_card_meta(self, payload):
+        """Apply BPM + play/favourite counts fetched from osu.direct to a card."""
+        sid, full = payload
+        card = self.cards.get(sid)
+        if card is None:
+            return
+        card.s.bpm = full.bpm
+        card.s.play_count = full.play_count
+        card.s.favourite_count = full.favourite_count
+        if full.diffs:                 # more accurate per-diff data (incl. BPM)
+            card.s.diffs = full.diffs
+        card._fill_text(card.s)
+
     def _load_cover(self, s: Beatmapset):
         if not s.cover_url:
             return
@@ -2019,7 +2610,7 @@ class MainWindow(QMainWindow):
 
     def _start_download(self, s: Beatmapset):
         dest = self.settings.value("songs_dir") or str(Path.home() / "osu-beatmaps")
-        no_video = self.cur_filters.get("no_video", False) if self.cur_filters else False
+        no_video = self.filter_bar.no_video.isChecked()   # live, not search-time
         worker = DownloadWorker(s, dest, no_video, MIRRORS)
         worker.signals.progress.connect(self._on_dl_progress)
         worker.signals.done.connect(self._on_dl_done)
@@ -2329,6 +2920,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName(ORG_NAME)
 
     icon_file = resource_path("icon.ico")
