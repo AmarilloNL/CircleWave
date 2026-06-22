@@ -55,6 +55,9 @@ two dependencies, so it's a couple of commands on any distro.
   seven categories (Standard, Featured Artist, Tournament, Project Loved, Spotlights, Theme,
   Artist/Album), with a game-mode filter and name search. Pick a pack and it loads exactly like a
   medal pack: download every map and build a collection named after the pack.
+- **Most played** — the 🔥 *Most played* button loads any player's most-played beatmaps by
+  username (no login or API key needed — it reads the public profile), ordered by play count.
+  Mass-download them and build a collection named after the player, exactly like a pack.
 - **One folder** — a single location does double duty: maps download into it and it's scanned to
   mark what you already have (auto-detects osu-wine / lazer / Windows / macOS). Combined with a local
   history file, "✓ In library" / hide-owned works for lazer too and across machines.
@@ -133,6 +136,7 @@ the pip PySide6 wheels are arm64-native.
   filter by artist. **Nerinyan** (`api.nerinyan.moe`) is the automatic fallback if it's unreachable.
 - BPM and play/favourite counts aren't in the mirror's search response, so visible cards enrich those
   on demand from **osu.direct**. No account or API key needed for any of this.
+- **Most played** reads the public osu! profile (the same JSON the website uses) — no login or key.
 - **Downloads** cascade across several mirrors (Nerinyan, Sayobot, catboy.best, Beatconnect) so a map
   that's slow or missing on one is fetched from another.
 

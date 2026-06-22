@@ -96,7 +96,7 @@ except Exception:  # pragma: no cover
 # Branding. APP_TITLE is the one place to change the product name -- it drives
 # the window title and the header wordmark.
 APP_TITLE = "Circlewave"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_TAGLINE = "osu! beatmap browser & downloader"
 ORG_NAME = "AmarilloNL"
 APP_NAME = "Circlewave"
@@ -127,6 +127,11 @@ PACK_TYPES = [
     ("Spotlights", "chart"), ("Theme", "theme"), ("Artist/Album", "artist"),
 ]
 PACK_PAGE_COUNT = 100          # packs per listing page
+# A user's most-played beatmaps (public; no auth). The profile URL redirects to
+# /users/{id}, and the website's own JSON route serves the most-played list.
+USER_PROFILE_URL = "https://osu.ppy.sh/users/{user}"
+MOST_PLAYED_URL = "https://osu.ppy.sh/users/{id}/beatmapsets/most_played?limit={limit}&offset={offset}"
+MOST_PLAYED_PAGE = 51          # the route caps a single request at 51
 
 PAGE_SIZE = 50
 # When a search is narrowed client-side (field scope, BPM / star / length range),
@@ -940,6 +945,47 @@ def fetch_pack_list(pack_type: str, page: int) -> list:
     return parse_pack_list(r.text)
 
 
+def fetch_most_played(username: str, limit: int) -> tuple:
+    """Resolve a username/ID and return (username, [Beatmapset, ...]) for their
+    most-played maps, deduped to beatmapsets and ordered by total play count.
+    Uses the public profile JSON route -- no login or API key."""
+    prof = requests.get(USER_PROFILE_URL.format(user=username),
+                        headers={"User-Agent": DOWNLOAD_UA}, timeout=HTTP_TIMEOUT)
+    prof.raise_for_status()
+    m = re.search(r"/users/(\d+)", prof.url)
+    if not m:
+        raise RuntimeError(f"couldn't find user '{username}'")
+    uid = m.group(1)
+    hdr = {"User-Agent": DOWNLOAD_UA, "Accept": "application/json",
+           "X-Requested-With": "XMLHttpRequest"}
+    sets, order, scanned, offset = {}, [], 0, 0
+    while scanned < limit:
+        n = min(MOST_PLAYED_PAGE, limit - scanned)
+        rr = requests.get(MOST_PLAYED_URL.format(id=uid, limit=n, offset=offset),
+                          headers=hdr, timeout=HTTP_TIMEOUT)
+        rr.raise_for_status()
+        batch = rr.json()
+        if not isinstance(batch, list) or not batch:
+            break
+        for item in batch:
+            bs = item.get("beatmapset")
+            if not isinstance(bs, dict) or not bs.get("id"):
+                continue
+            sid = bs["id"]
+            cnt = int(item.get("count", 0) or 0)
+            if sid in sets:                      # same set, another difficulty
+                sets[sid]["count"] += cnt
+            else:
+                sets[sid] = {"set": Beatmapset.from_json(bs), "count": cnt}
+                order.append(sid)
+        scanned += len(batch)
+        offset += len(batch)
+        if len(batch) < n:                       # reached the end of their plays
+            break
+    order.sort(key=lambda sid: -sets[sid]["count"])
+    return username, [sets[sid]["set"] for sid in order]
+
+
 def fetch_pack_medals() -> list:
     """Download the wiki table and return the medal -> pack-tag list."""
     r = requests.get(MEDAL_WIKI_URL, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
@@ -1463,6 +1509,7 @@ class FilterBar(QWidget):
     searchRequested = Signal()
     medalPacksRequested = Signal()
     beatmapPacksRequested = Signal()
+    mostPlayedRequested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -1515,6 +1562,12 @@ class FilterBar(QWidget):
         self.packs_btn.setToolTip("Browse all osu! beatmap packs by category and mode")
         self.packs_btn.clicked.connect(self.beatmapPacksRequested.emit)
         row1.addWidget(self.packs_btn)
+
+        self.mostplayed_btn = QPushButton("\U0001F525  Most played")
+        self.mostplayed_btn.setObjectName("medalbtn")
+        self.mostplayed_btn.setToolTip("Load a player's most-played beatmaps and grab them all")
+        self.mostplayed_btn.clicked.connect(self.mostPlayedRequested.emit)
+        row1.addWidget(self.mostplayed_btn)
         outer.addLayout(row1)
 
         # filters live in a distinct surface panel so they read as real controls
@@ -1911,6 +1964,65 @@ class BeatmapPacksDialog(QDialog):
             self.accept()
 
 
+class MostPlayedDialog(QDialog):
+    """Ask for an osu! username/ID and how many most-played maps to load."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Most played")
+        self.resize(440, 210)
+        self.username = None
+        self.limit = 100
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(10)
+        head = QLabel("Load a player's most-played beatmaps. Enter their osu! username "
+                      "(or user ID) \u2014 then mass-download the maps and build a "
+                      "collection named after them.")
+        head.setObjectName("hint")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+
+        self.user_in = QLineEdit()
+        self.user_in.setPlaceholderText("osu! username or ID\u2026")
+        self.user_in.returnPressed.connect(self._accept)
+        lay.addWidget(self.user_in)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        lbl = QLabel("How many:")
+        lbl.setObjectName("hint")
+        row.addWidget(lbl)
+        self.count = QComboBox()
+        for label, val in [("Top 50", 50), ("Top 100", 100), ("Top 200", 200), ("Top 500", 500)]:
+            self.count.addItem(label, val)
+        self.count.setCurrentIndex(1)
+        row.addWidget(self.count, 1)
+        lay.addLayout(row)
+
+        lay.addStretch(1)
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("smallbtn")
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(cancel)
+        ok = QPushButton("Load")
+        ok.setObjectName("primary")
+        ok.clicked.connect(self._accept)
+        btns.addWidget(ok)
+        lay.addLayout(btns)
+        self.user_in.setFocus()
+
+    def _accept(self):
+        u = self.user_in.text().strip()
+        if not u:
+            return
+        self.username = u
+        self.limit = self.count.currentData()
+        self.accept()
+
+
 # ----------------------------------------------------------------------------
 # SETTINGS DIALOG
 # ----------------------------------------------------------------------------
@@ -2089,6 +2201,7 @@ class MainWindow(QMainWindow):
         self.filter_bar.searchRequested.connect(self.new_search)
         self.filter_bar.medalPacksRequested.connect(self._open_medal_packs)
         self.filter_bar.beatmapPacksRequested.connect(self._open_beatmap_packs)
+        self.filter_bar.mostPlayedRequested.connect(self._open_most_played)
         root.addWidget(self.filter_bar)
 
         rule = QFrame()
@@ -2327,6 +2440,53 @@ class MainWindow(QMainWindow):
             p = dlg.chosen
             # reuse pack mode: one tag, collection named after the pack
             self._enter_pack_mode({"medal": p["name"], "tags": [p["tag"]]})
+
+    def _open_most_played(self):
+        dlg = MostPlayedDialog(self)
+        if not (dlg.exec() and dlg.username):
+            return
+        if self.pack:
+            self._exit_pack_mode(refresh=False)
+        self.pack = None
+        self.more = False
+        self.loading = False
+        self._clear_grid()
+        self.pack_banner.show()
+        self.pack_dl_btn.setEnabled(False)
+        self.pack_label.setText(f"\U0001F525  Most played by {dlg.username}   \u2014   loading\u2026")
+        self.status_label.setText("Fetching most-played maps\u2026")
+        w = Worker(fetch_most_played, dlg.username, dlg.limit)
+        w.signals.result.connect(self._on_most_played)
+        w.signals.error.connect(self._on_pack_error)
+        self.pool.start(w)
+
+    @Slot(object)
+    def _on_most_played(self, payload):
+        user, sets = payload
+        if not sets:
+            self.pack_label.setText(f"\U0001F525  No most-played maps found for {user}")
+            self.status_label.setText("Nothing found")
+            return
+        self._enter_setlist_mode(f"{user}'s most played", sets, icon="\U0001F525")
+
+    def _enter_setlist_mode(self, name: str, sets: list, icon: str = "\U0001F3C5"):
+        """Pack mode fed a pre-built set list (most-played, etc.) instead of a pack
+        page. Reuses the download + collection flow via self.pack."""
+        self.pack = {"medal": name, "tags": [], "ids": [s.id for s in sets],
+                     "hashes": {}, "pending": set(), "collecting": False}
+        self.more = False
+        self.loading = False
+        self._clear_grid()
+        self._refresh_downloaded()
+        self.pack_banner.show()
+        for s in sets:
+            self._add_card(s, s.id in self.downloaded_ids)
+        n = len(sets)
+        have = sum(1 for s in sets if s.id in self.downloaded_ids)
+        self.pack_label.setText(f"{icon}  {name}   \u2014   {n} maps"
+                                + (f"  ({have} already in library)" if have else ""))
+        self.pack_dl_btn.setEnabled(True)
+        self.status_label.setText(f"{n} maps")
 
     def _enter_pack_mode(self, medal: dict):
         self.pack = {"medal": medal["medal"], "tags": medal["tags"],
