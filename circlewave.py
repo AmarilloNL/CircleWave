@@ -96,7 +96,7 @@ except Exception:  # pragma: no cover
 # Branding. APP_TITLE is the one place to change the product name -- it drives
 # the window title and the header wordmark.
 APP_TITLE = "Circlewave"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 APP_TAGLINE = "osu! beatmap browser & downloader"
 ORG_NAME = "AmarilloNL"
 APP_NAME = "Circlewave"
@@ -208,8 +208,8 @@ LANGUAGES = [
 # Map our status strings to hinamizawa numeric RankedStatus codes. "Ranked"
 # bundles ranked(1)+approved(2), matching how osu! and the mirror's own UI treat
 # it (sent as a comma list); "Any" omits the param.
-HINA_STATUS = {"all": [1, 2, 3, 4, 0, -1, -2],   # no "all" sentinel exists, so fan out
-               "ranked": [1, 2], "qualified": [3], "loved": [4],
+HINA_STATUS = {"all": [1, 3, 4, 0, -2],          # distinct buckets only (2==1, -1==0)
+               "ranked": [1], "qualified": [3], "loved": [4],
                "pending": [0], "wip": [-1], "graveyard": [-2]}
 # The mirror's response RankedStatus is coarse/unreliable (only 0/1), so we tag
 # each result with the status code we *queried* instead -- that's authoritative.
@@ -526,15 +526,19 @@ def _hina_get(params: dict, status_code=None) -> list:
 
 
 def _client_sort(sets: list, sort_key: str) -> list:
-    """Sort a field-scoped result set locally. Only title/artist are reliably
-    sortable here (play counts/dates aren't in the response), so other sorts keep
-    the relevance/exactness order they already have."""
+    """Sort a merged/field-scoped result set locally. Title/artist sort on those
+    fields; ranked/updated use the set id as an age proxy (lower id = older), since
+    the search response has no date/play fields. Other sorts keep their order."""
     if sort_key == "title_asc":
         return sorted(sets, key=lambda s: s.title.lower())
     if sort_key == "title_desc":
         return sorted(sets, key=lambda s: s.title.lower(), reverse=True)
     if sort_key == "artist_asc":
         return sorted(sets, key=lambda s: s.artist.lower())
+    if sort_key == "ranked_asc":
+        return sorted(sets, key=lambda s: s.id)
+    if sort_key in ("ranked_desc", "updated_desc"):
+        return sorted(sets, key=lambda s: s.id, reverse=True)
     return sets
 
 
@@ -567,35 +571,37 @@ def _search_hinamizawa(filters: dict, token) -> tuple:
     codes = HINA_STATUS.get(filters.get("status")) or [1]   # default to ranked-tier
     getter = _FIELD_GETTERS.get(filters.get("option") or "")
     field_scope = bool(q and getter and filters.get("option") != "tag")
+    multi = len(codes) > 1                                  # only "Any" now
 
-    if field_scope:
-        # Fetch every requested status by relevance (no sort, no paging) so the
-        # artist's full catalogue clusters in; merge, keep matches, sort locally.
+    if field_scope or multi:
+        # One batch per status code, merged into a single (unpaginated) result.
+        # Field scope fetches by relevance so the artist's catalogue clusters in;
+        # otherwise we server-sort each code. Either way we re-sort the *merged*
+        # list locally so statuses interleave instead of appending in blocks
+        # (which made "oldest" show old maps then a wall of fresh qualified ones).
+        sort = HINA_SORT.get(filters.get("sort"))
+        if sort and not field_scope:
+            base["sort"] = sort
         sets, have = [], set()
         for c in codes:
             for s in _hina_get(dict(base), c):
                 if s.id not in have:
                     have.add(s.id)
                     sets.append(s)
-        ranked = [(rk, s) for s in sets
-                  for rk in (_field_rank(getter(s), q),) if rk >= 0]
-        ranked.sort(key=lambda t: t[0])
-        sets = _client_sort([s for _, s in ranked], filters.get("sort"))
+        if field_scope:
+            ranked = [(rk, s) for s in sets
+                      for rk in (_field_rank(getter(s), q),) if rk >= 0]
+            ranked.sort(key=lambda t: t[0])
+            sets = [s for _, s in ranked]
+        sets = _client_sort(sets, filters.get("sort"))
         next_token = None
     else:
-        # Browse: the primary status code paginates via offset; any extra codes
-        # (e.g. approved under "Ranked", or all of them under "Any") merge on page 1.
+        # Single status: page server-side via offset, server-sorted.
         sort = HINA_SORT.get(filters.get("sort"))
         if sort:
             base["sort"] = sort
         raw = _hina_get(dict(base, offset=offset), codes[0])
-        sets, have = list(raw), {s.id for s in raw}
-        if len(codes) > 1 and offset == 0:
-            for c in codes[1:]:
-                for s in _hina_get(dict(base), c):
-                    if s.id not in have:
-                        have.add(s.id)
-                        sets.append(s)
+        sets = list(raw)
         next_token = offset + HINA_AMOUNT if len(raw) >= HINA_AMOUNT else None
 
     # stars + length client-side (bpm is filtered server-side; bpm fields are 0)
@@ -1398,27 +1404,34 @@ class BeatmapCard(QFrame):
             sub += "   \u00b7   in pack"
         self.sub_lbl.setText(sub)
 
-    def apply_full(self, full: Beatmapset):
-        """Upgrade a minimal pack card in place once full metadata arrives:
-        real status colour, star badge, mapper and play/favourite stats."""
-        self.s = full
-        color = STATUS_COLORS.get(full.status, "#8a8a8a")
-        self.status_badge.setText(full.status or "?")
+    def _refresh_badges(self):
+        """Update the status colour + star-range badges from self.s (used after
+        full metadata arrives, since the lazy enrich only fills text otherwise)."""
+        s = self.s
+        color = STATUS_COLORS.get(s.status, "#8a8a8a")
+        self.status_badge.setText(s.status or "?")
         self.status_badge.setStyleSheet(
             f"background:{color}; color:#15151a; border-radius:5px;"
             "padding:2px 8px; font-size:11px; font-weight:700;")
         self.status_badge.adjustSize()
         self.status_badge.move(8, 8)
-
-        lo, hi = full.sr_range
-        self.sr_badge.setText(f"\u2605 {lo:.1f}" if abs(hi - lo) < 0.05
-                              else f"\u2605 {lo:.1f}\u2013{hi:.1f}")
-        self.sr_badge.adjustSize()
-        self.sr_badge.move(max(self.width(), self.CARD_W) - self.sr_badge.width() - 8, 8)
-        self.sr_badge.show()
+        lo, hi = s.sr_range
+        if hi > 0:
+            self.sr_badge.setText(f"\u2605 {lo:.1f}" if abs(hi - lo) < 0.05
+                                  else f"\u2605 {lo:.1f}\u2013{hi:.1f}")
+            self.sr_badge.adjustSize()
+            self.sr_badge.move(max(self.width(), self.CARD_W) - self.sr_badge.width() - 8, 8)
+            self.sr_badge.show()
+        else:
+            self.sr_badge.hide()
         self.sr_badge.raise_()
         self.status_badge.raise_()
 
+    def apply_full(self, full: Beatmapset):
+        """Upgrade a minimal pack card in place once full metadata arrives:
+        real status colour, star badge, mapper and play/favourite stats."""
+        self.s = full
+        self._refresh_badges()
         self._in_pack = True
         self._fill_text(full)
 
@@ -1882,6 +1895,7 @@ class BeatmapPacksDialog(QDialog):
         self.list.itemDoubleClicked.connect(lambda *_: self._accept())
         self.list.itemSelectionChanged.connect(
             lambda: self.load_btn.setEnabled(self.list.currentItem() is not None))
+        self.list.verticalScrollBar().valueChanged.connect(self._pack_scrolled)
         lay.addWidget(self.list, 1)
 
         self.status = QLabel("Loading packs\u2026")
@@ -1926,6 +1940,12 @@ class BeatmapPacksDialog(QDialog):
         w.signals.result.connect(self._loaded)
         w.signals.error.connect(self._failed)
         self.pool.start(w)
+
+    def _pack_scrolled(self, value):
+        # auto-load the next page as the list nears the bottom
+        bar = self.list.verticalScrollBar()
+        if not self.loading and self.has_more and bar.maximum() - value < 160:
+            self._load_next()
 
     def _loaded(self, packs):
         self.loading = False
@@ -2687,6 +2707,7 @@ class MainWindow(QMainWindow):
         if full.diffs:                 # more accurate per-diff data (incl. BPM)
             card.s.diffs = full.diffs
         card._fill_text(card.s)
+        card._refresh_badges()         # most-played payload has no diffs -> stars now show
 
     def _load_cover(self, s: Beatmapset):
         if not s.cover_url:

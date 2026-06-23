@@ -4,6 +4,22 @@ All notable changes to CircleWave are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-06-23
+
+### Changed
+- **Beatmap packs load automatically as you scroll** instead of needing the "Load
+  more" button each time.
+
+### Fixed
+- **Sort by oldest under "Any" status** no longer shows old maps followed by a block
+  of freshly-qualified ones — all statuses are now ordered together.
+- **Most-played cards now show their star rating** (the most-played data has no
+  difficulty info, so it's pulled from osu.direct like BPM).
+
+> Note: some very old graveyard maps (pre-2009, and pre-2012 maps with video) aren't
+> searchable or downloadable from osu!'s mirrors at all, so they can't appear here —
+> an osu!-side limitation, not a CircleWave bug.
+
 ## [1.2.0] - 2026-06-20
 
 ### Added
@@ -61,6 +77,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - "Already in library" detection and hide-owned, driven by your osu! Songs folder.
 - GPL-3.0 licensed; Windows `.exe` built via GitHub Actions.
 
+[1.2.1]: https://github.com/AmarilloNL/CircleWave/releases/tag/v1.2.1
 [1.2.0]: https://github.com/AmarilloNL/CircleWave/releases/tag/v1.2.0
 [1.1.0]: https://github.com/AmarilloNL/CircleWave/releases/tag/v1.1.0
 [1.0.0]: https://github.com/AmarilloNL/CircleWave/releases/tag/v1.0.0
