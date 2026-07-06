@@ -7,6 +7,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Collection manager** (🗂) — view, rename, delete and merge the collections in
+  your `collection.db`, with a library summary. Every edit backs up first.
+- **Beatmap detail panel** (ⓘ on a card) — every difficulty at a glance, plus
+  one-click **More by mapper** / **More by artist** scoped searches.
+- **Persistent download queue** — a batch survives a restart: pending and
+  in-flight items are saved and restored (paused), resuming via their `.part`
+  files. New **Retry failed** button re-queues everything that errored.
+- **Filter presets** (★) — save the current filter set under a name and re-apply
+  it in one click.
+- **Random / surprise me** (🎲) and **search-box history** (autocomplete of recent
+  queries).
+- **Check for updates** (⟳) — scans your downloaded `.osz` files against
+  authoritative per-diff checksums and offers to re-download any with a newer
+  version online.
+- **Accent themes** — pick from several pink/cyan-style palettes in Settings.
+- **System tray** icon + a notification when the queue finishes; **keyboard
+  shortcuts** (Ctrl+F, F5, Ctrl+R, Ctrl+D, Ctrl+Shift+C, Ctrl+,, Esc);
+  **live download speed + ETA**; and the app now **reopens with your last filters**.
+- **Optional official osu! API** — set OAuth client credentials in Settings
+  (client-credentials grant, no user login) for higher rate limits and
+  authoritative data used by the update check.
 - **Collection write preview** — before a `collection.db` is created or modified,
   a confirmation dialog shows how many maps go in, whether a same-named collection
   is being replaced, which others are kept, and where the file lands.
@@ -23,7 +44,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   imported into lazer via its Setup Wizard's Import step.
 
 ### Internal
-- Split the Qt-free logic into `circlewave_core.py` with a `pytest` suite (49 tests);
+- Split the Qt-free logic into `circlewave_core.py` with a `pytest` suite (74 tests);
   builds now run the tests before packaging. Swallowed errors are now logged
   (tunable via `CIRCLEWAVE_LOG`).
 
