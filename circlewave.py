@@ -1837,6 +1837,11 @@ class MainWindow(QMainWindow):
             self.vol_slider.setToolTip("Preview volume")
             self.vol_slider.valueChanged.connect(self._set_volume)
             self.status.addPermanentWidget(self.vol_slider)
+        self.updates_btn = QPushButton("⟳ Updates")
+        self.updates_btn.setObjectName("smallbtn")
+        self.updates_btn.setToolTip("Check your downloaded .osz files for newer versions online")
+        self.updates_btn.clicked.connect(self._check_updates)
+        self.status.addPermanentWidget(self.updates_btn)
         collections_btn = QPushButton("\U0001F5C2 Collections")
         collections_btn.setObjectName("smallbtn")
         collections_btn.setToolTip("View, rename, delete or merge your osu! collections")
@@ -2556,6 +2561,59 @@ class MainWindow(QMainWindow):
         dlg.downloadRequested.connect(self.enqueue_download)
         dlg.searchRequested.connect(self._search_field)
         dlg.exec()
+
+    # -- map update checking ------------------------------------------------
+    def _update_fetch_fn(self):
+        """A fetch(set_id)->Beatmapset with authoritative checksums: the official
+        API if credentials are set, else osu.direct."""
+        cid = (self.settings.value("client_id") or "").strip()
+        secret = (self.settings.value("client_secret") or "").strip()
+        if cid and secret:
+            token = fetch_oauth_token(cid, secret)     # once per scan
+            return lambda sid: osu_api_beatmapset(sid, token)
+        return lambda sid: fetch_card_meta(sid)[1]
+
+    def _check_updates(self):
+        songs = (self.settings.value("songs_dir") or "").strip()
+        if not songs or not Path(songs).is_dir():
+            QMessageBox.information(self, "Check for updates",
+                                    "Set your Songs / download folder in Settings first.")
+            return
+        self.updates_btn.setEnabled(False)
+        self.status_label.setText("Checking your downloaded maps for updates…")
+
+        def job():
+            return scan_local_updates(songs, self._update_fetch_fn(), cap=300)
+
+        w = Worker(job)
+        w.signals.result.connect(self._on_updates_found)
+        w.signals.error.connect(self._on_updates_error)
+        self.pool.start(w)
+
+    @Slot(str)
+    def _on_updates_error(self, msg):
+        self.updates_btn.setEnabled(True)
+        self.status_label.setText(f"Update check failed: {msg}")
+
+    @Slot(object)
+    def _on_updates_found(self, sets):
+        self.updates_btn.setEnabled(True)
+        if not sets:
+            self.status_label.setText("Your downloaded maps are up to date.")
+            QMessageBox.information(self, "Check for updates",
+                                    "Everything's up to date (checked .osz files only).")
+            return
+        self.status_label.setText(f"{len(sets)} map(s) have updates available.")
+        preview = "\n".join(f"• {s.artist} - {s.title}" for s in sets[:25])
+        if len(sets) > 25:
+            preview += f"\n… and {len(sets) - 25} more"
+        if QMessageBox.question(
+                self, "Updates available",
+                f"{len(sets)} downloaded map(s) have a newer version online:\n\n{preview}"
+                "\n\nRe-download them now?",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes) == QMessageBox.Yes:
+            for s in sets:
+                self.enqueue_download(s)
 
     def _search_field(self, option: str, text: str):
         """Run a scoped search (e.g. all maps by a mapper/artist) from a detail panel."""
