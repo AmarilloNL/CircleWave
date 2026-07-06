@@ -4,7 +4,7 @@ All notable changes to CircleWave are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.3.0] - 2026-07-06
 
 ### Added
 - **Collection manager** (🗂) — view, rename, delete and merge the collections in
@@ -124,6 +124,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - "Already in library" detection and hide-owned, driven by your osu! Songs folder.
 - GPL-3.0 licensed; Windows `.exe` built via GitHub Actions.
 
+[2.3.0]: https://github.com/AmarilloNL/CircleWave/releases/tag/v2.3.0
 [1.2.1]: https://github.com/AmarilloNL/CircleWave/releases/tag/v1.2.1
 [1.2.0]: https://github.com/AmarilloNL/CircleWave/releases/tag/v1.2.0
 [1.1.0]: https://github.com/AmarilloNL/CircleWave/releases/tag/v1.1.0

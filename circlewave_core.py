@@ -85,7 +85,7 @@ def _osu_throttle():
 # Branding. APP_TITLE is the one place to change the product name -- it drives
 # the window title and the header wordmark.
 APP_TITLE = "Circlewave"
-APP_VERSION = "1.2.1"
+APP_VERSION = "2.3.0"
 APP_TAGLINE = "osu! beatmap browser & downloader"
 ORG_NAME = "AmarilloNL"
 APP_NAME = "Circlewave"
