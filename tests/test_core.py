@@ -505,3 +505,47 @@ def test_osu_api_beatmapset(monkeypatch):
     s = c.osu_api_beatmapset(5, "tok")
     assert s.id == 5
     assert s.diffs[0].checksum == "d" * 32     # checksums flow through for update checks
+
+
+# --------------------------------------------------------------------------
+# Local update scanning
+# --------------------------------------------------------------------------
+def test_find_local_osz(tmp_path):
+    (tmp_path / "123 A - B.osz").write_bytes(b"PK\x03\x04")
+    (tmp_path / "999 X - Y.osz").write_bytes(b"PK\x03\x04")
+    got = c.find_local_osz(str(tmp_path), 123)
+    assert got is not None and got.name.startswith("123")
+    assert c.find_local_osz(str(tmp_path), 555) is None
+
+
+def test_scan_local_updates(tmp_path):
+    import hashlib
+    # set 100 is up to date; set 200 is outdated (remote checksum not on disk)
+    up_to_date = _osz(tmp_path, "100 A - B.osz", [b"one", b"two"])
+    _osz(tmp_path, "200 C - D.osz", [b"old"])
+    hashes_100 = [hashlib.md5(b).hexdigest() for b in (b"one", b"two")]
+
+    def fetch(sid):
+        if sid == 100:
+            diffs = [c.Diff("osu", 1.0, 0, 0, "d", checksum=h) for h in hashes_100]
+        else:
+            diffs = [c.Diff("osu", 1.0, 0, 0, "d", checksum="f" * 32)]
+        return c.Beatmapset(id=sid, title="", artist="", creator="", status="",
+                            bpm=0, play_count=0, favourite_count=0, cover_url="",
+                            diffs=diffs)
+
+    seen = []
+    out = c.scan_local_updates(str(tmp_path), fetch, progress=lambda d, t: seen.append((d, t)))
+    assert [s.id for s in out] == [200]        # only the outdated one
+    assert seen[-1][0] == seen[-1][1]          # progress reached total
+
+
+def test_scan_local_updates_can_stop(tmp_path):
+    _osz(tmp_path, "1 A - B.osz", [b"x"])
+    _osz(tmp_path, "2 A - B.osz", [b"y"])
+    calls = []
+    def fetch(sid):
+        calls.append(sid)
+        raise RuntimeError("stop after first")
+    c.scan_local_updates(str(tmp_path), fetch, should_stop=lambda: len(calls) >= 1)
+    assert len(calls) == 1                      # stopped before the second file

@@ -988,6 +988,61 @@ def local_osz_is_outdated(osz_path, s: "Beatmapset"):
     return not current.issubset(local)
 
 
+def find_local_osz(songs_dir: str, set_id: int):
+    """The .osz file for a set id in the download folder, or None. (Only files are
+    checkable for updates; extracted map *folders* have no single archive to hash.)"""
+    p = Path(songs_dir) if songs_dir else None
+    if not p or not p.is_dir():
+        return None
+    try:
+        for entry in p.iterdir():
+            if entry.is_file() and entry.suffix.lower() == ".osz":
+                m = re.match(r"^(\d+)\b", entry.name)
+                if m and int(m.group(1)) == set_id:
+                    return entry
+    except OSError:
+        pass
+    return None
+
+
+def scan_local_updates(songs_dir: str, fetch_fn, cap=None, progress=None,
+                       should_stop=None) -> list:
+    """Find downloaded .osz files that have a newer version online.
+
+    `fetch_fn(set_id) -> Beatmapset` supplies authoritative per-diff checksums
+    (osu.direct or the official API). Returns the outdated sets as Beatmapsets, so
+    the caller can re-queue them. `progress(done, total)` and `should_stop()` are
+    optional hooks for a worker thread.
+    """
+    p = Path(songs_dir) if songs_dir else None
+    if not p or not p.is_dir():
+        return []
+    files = []
+    try:
+        for entry in p.iterdir():
+            if entry.is_file() and entry.suffix.lower() == ".osz":
+                m = re.match(r"^(\d+)\b", entry.name)
+                if m:
+                    files.append((int(m.group(1)), entry))
+    except OSError:
+        return []
+    if cap:
+        files = files[:cap]
+    total, outdated = len(files), []
+    for i, (sid, path) in enumerate(files):
+        if should_stop and should_stop():
+            break
+        try:
+            s = fetch_fn(sid)
+            if local_osz_is_outdated(path, s):
+                outdated.append(s)
+        except Exception as e:  # noqa: BLE001
+            log.debug("update check failed for %s: %s", sid, e)
+        if progress:
+            progress(i + 1, total)
+    return outdated
+
+
 def library_stats(songs_dir: str) -> dict:
     """Cheap, top-level library summary: how many beatmapsets are present and the
     total size of the .osz files sitting in the download folder. Extracted map
