@@ -19,6 +19,32 @@ def test_core_has_no_qt():
 
 
 # --------------------------------------------------------------------------
+# HTTP session: pooling + retry/backoff
+# --------------------------------------------------------------------------
+def test_session_has_retry_adapter():
+    import requests
+    assert isinstance(c.SESSION, requests.Session)
+    adapter = c.SESSION.get_adapter("https://example.com")
+    retry = adapter.max_retries
+    assert retry.total == 3
+    assert 429 in retry.status_forcelist and 503 in retry.status_forcelist
+    assert retry.backoff_factor == 0.5
+
+
+def test_osu_throttle_enforces_min_interval(monkeypatch):
+    # Each call reads monotonic() twice (wait calc + timestamp update).
+    ticks = iter([100.0, 100.0,     # 1st call: elapsed since last(=0) is huge -> no wait
+                  100.1, 100.1])    # 2nd call: only 0.1s since last -> waits 0.4s
+    slept = []
+    monkeypatch.setattr(c.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(c.time, "sleep", slept.append)
+    c._osu_last = 0.0
+    c._osu_throttle()
+    c._osu_throttle()
+    assert slept and abs(slept[0] - (c._OSU_MIN_INTERVAL - 0.1)) < 1e-6
+
+
+# --------------------------------------------------------------------------
 # ULEB128 / osu-string primitives
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize("n", [0, 1, 0x7f, 0x80, 0x81, 300, 16384, 1_000_000])
