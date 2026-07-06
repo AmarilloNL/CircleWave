@@ -21,7 +21,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Check for updates** (⟳) — scans your downloaded `.osz` files against
   authoritative per-diff checksums and offers to re-download any with a newer
   version online.
-- **Accent themes** — pick from several pink/cyan-style palettes in Settings.
+- **16 full-UI themes** — Settings offers a real theme picker (Synthwave, Matrix,
+  Ember, Dracula, Aurora, Carbon, Bubblegum…). Each recolours the *entire* UI —
+  backgrounds, surfaces, borders, text and both accents — derived from seed
+  colours, not just the two highlight colours.
 - **System tray** icon + a notification when the queue finishes; **keyboard
   shortcuts** (Ctrl+F, F5, Ctrl+R, Ctrl+D, Ctrl+Shift+C, Ctrl+,, Esc);
   **live download speed + ETA**; and the app now **reopens with your last filters**.

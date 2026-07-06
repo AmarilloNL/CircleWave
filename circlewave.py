@@ -646,11 +646,12 @@ def elide(text: str, width: int, bold: bool = False, px: int = 0) -> str:
     return fm.elidedText(text, Qt.ElideRight, width)
 
 
-def apply_glow(widget, hexcolor="#ff66ab", radius=22, alpha=150):
-    """Soft neon glow around a widget (Qt has no CSS box-shadow)."""
+def apply_glow(widget, hexcolor=None, radius=22, alpha=150):
+    """Soft neon glow around a widget (Qt has no CSS box-shadow). Defaults to the
+    active theme's accent."""
     eff = QGraphicsDropShadowEffect(widget)
     eff.setBlurRadius(radius)
-    col = QColor(hexcolor)
+    col = QColor(hexcolor or ACCENT_HEX)
     col.setAlpha(alpha)
     eff.setColor(col)
     eff.setOffset(0, 0)
@@ -679,12 +680,12 @@ class FilterBar(QWidget):
         logo = QLabel("\u25ce")          # hitcircle motif
         logo.setObjectName("logo")
         row1.addWidget(logo)
-        # Two-tone wordmark: last ~4 letters get the cyan accent. Falls back to a
-        # single colour for very short names. Driven entirely by APP_TITLE.
+        # Two-tone wordmark: last ~4 letters get the secondary accent. Falls back to
+        # a single colour for very short names. Driven entirely by APP_TITLE.
         _t = APP_TITLE
         if len(_t) > 4:
             _head, _tail = _t[:-4], _t[-4:]
-            _markup = f"{_head}<span style='color:#36e0ff'>{_tail}</span>"
+            _markup = f"{_head}<span style='color:{ACCENT2_HEX}'>{_tail}</span>"
         else:
             _markup = _t
         wordmark = QLabel(_markup)
@@ -698,13 +699,13 @@ class FilterBar(QWidget):
         self.query.setObjectName("search")
         self.query.setPlaceholderText("Search title, artist, mapper, tags\u2026   (leave empty for the A\u2013Z catalog)")
         self.query.returnPressed.connect(self.searchRequested.emit)
-        apply_glow(self.query, "#ff66ab", radius=16, alpha=70)
+        apply_glow(self.query, radius=16, alpha=70)
         row1.addWidget(self.query, 1)
 
         self.search_btn = QPushButton("Search")
         self.search_btn.setObjectName("primary")
         self.search_btn.clicked.connect(self.searchRequested.emit)
-        apply_glow(self.search_btn, "#ff66ab", radius=20, alpha=130)
+        apply_glow(self.search_btn, radius=20, alpha=130)
         row1.addWidget(self.search_btn)
 
         self.medals_btn = QPushButton("\U0001F3C5  Medal packs")
@@ -1706,6 +1707,10 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # Resolve the theme first so the accent globals are set before widgets that
+        # read them (the search-box glow, the wordmark) are built.
+        style = themed_style(self.settings.value("accent", "synthwave"))
+
         self.filter_bar = FilterBar()
         self.filter_bar.searchRequested.connect(self.new_search)
         self.filter_bar.medalPacksRequested.connect(self._open_medal_packs)
@@ -1852,7 +1857,7 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self._open_settings)
         self.status.addPermanentWidget(settings_btn)
 
-        self.setStyleSheet(themed_style(self.settings.value("accent", "synthwave")))
+        self.setStyleSheet(style)
 
     def _setup_audio(self):
         self.player = None
@@ -2716,13 +2721,17 @@ class MainWindow(QMainWindow):
 # ----------------------------------------------------------------------------
 # STYLE  (synthwave / osu! neon theme  -- pink x cyan on deep indigo)
 # ----------------------------------------------------------------------------
+# The stylesheet is a template: every colour is a ${token}. A theme supplies just
+# a few seed colours and _derive_palette() expands them into the full ~30-token
+# palette, so switching themes recolours the whole UI -- backgrounds, surfaces,
+# borders, text and both accents -- not merely the two highlight colours.
 STYLE = """
-* { font-family: "Inter", "Segoe UI", "Noto Sans", sans-serif; font-size: 12px; color: #f1ecfb; }
+* { font-family: "Inter", "Segoe UI", "Noto Sans", sans-serif; font-size: 12px; color: ${text}; }
 
-QMainWindow, QDialog { background: #100c1a; }
+QMainWindow, QDialog { background: ${bg}; }
 QWidget { background: transparent; }
 QMainWindow > QWidget, QDialog > QWidget {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #16101f, stop:1 #0e0a16);
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 ${bg2}, stop:1 ${bg_deep});
 }
 
 QScrollArea#results { background: transparent; border: none; }
@@ -2730,196 +2739,298 @@ QScrollArea { border: none; }
 
 /* ---- cards ---- */
 #card {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #221a35, stop:1 #1b1530);
-    border: 1px solid #342a4d; border-radius: 14px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 ${surface}, stop:1 ${surface2});
+    border: 1px solid ${border2}; border-radius: 14px;
 }
-#card:hover { border: 1px solid #ff66ab; }
+#card:hover { border: 1px solid ${accent}; }
 #card[owned="true"] {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1c2530, stop:1 #16202a);
-    border: 1px solid #2f4a48;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 ${owned_surface}, stop:1 ${owned_surface2});
+    border: 1px solid ${owned_border};
 }
 #cover {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2a2142, stop:0.5 #3a2350, stop:1 #2a2142);
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 ${cover_a}, stop:0.5 ${cover_b}, stop:1 ${cover_a});
     border-top-left-radius: 14px; border-top-right-radius: 14px;
-    color: #5b5078; font-size: 30px;
+    color: ${text_faint}; font-size: 30px;
 }
-#title { font-size: 17px; font-weight: 700; color: #ffffff; }
-#meta { color: #cabfe8; font-size: 14px; }
-#stats { color: #3fe3ff; font-size: 13px; font-weight: 600; }
-#sub { color: #9b90bd; font-size: 13px; }
+#title { font-size: 17px; font-weight: 700; color: ${text_bright}; }
+#meta { color: ${text_mid}; font-size: 14px; }
+#stats { color: ${accent2_soft}; font-size: 13px; font-weight: 600; }
+#sub { color: ${text_dim}; font-size: 13px; }
 
 /* ---- inputs ---- */
-#fieldlabel { color: #9a8fc0; font-size: 10px; font-weight: 800; }
+#fieldlabel { color: ${text_dim}; font-size: 10px; font-weight: 800; }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-    background: #241c39; border: 1px solid #3d3059; border-radius: 9px;
-    padding: 7px 11px; font-size: 13px; selection-background-color: #ff66ab; color: #f1ecfb;
+    background: ${input}; border: 1px solid ${border}; border-radius: 9px;
+    padding: 7px 11px; font-size: 13px; selection-background-color: ${accent}; color: ${text};
 }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #ff66ab; }
-QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover { border: 1px solid #5a4785; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid ${accent}; }
+QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover { border: 1px solid ${border_hi}; }
 QComboBox::drop-down { border: none; width: 22px; }
 QComboBox::down-arrow { width: 11px; height: 11px; }
 QComboBox QAbstractItemView {
-    background: #1d1730; border: 1px solid #382c52; selection-background-color: #ff66ab;
-    selection-color: #14101e; outline: none; padding: 4px;
+    background: ${input2}; border: 1px solid ${border2}; selection-background-color: ${accent};
+    selection-color: ${on_accent}; outline: none; padding: 4px;
 }
 QSpinBox::up-button, QDoubleSpinBox::up-button {
     subcontrol-origin: border; subcontrol-position: top right; width: 20px;
-    background: #2e2450; border-left: 1px solid #3d3059; border-top-right-radius: 9px;
+    background: ${raise2}; border-left: 1px solid ${border}; border-top-right-radius: 9px;
 }
 QSpinBox::down-button, QDoubleSpinBox::down-button {
     subcontrol-origin: border; subcontrol-position: bottom right; width: 20px;
-    background: #2e2450; border-left: 1px solid #3d3059; border-bottom-right-radius: 9px;
+    background: ${raise2}; border-left: 1px solid ${border}; border-bottom-right-radius: 9px;
 }
 QSpinBox::up-button:hover, QSpinBox::down-button:hover,
-QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { background: #ff66ab; }
+QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { background: ${accent}; }
 QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { width: 10px; height: 10px; }
 QSpinBox::down-arrow, QDoubleSpinBox::down-arrow { width: 10px; height: 10px; }
 #filterpanel {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1b1530, stop:1 #161025);
-    border: 1px solid #2f2548; border-radius: 13px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 ${surface2}, stop:1 ${bg2});
+    border: 1px solid ${border2}; border-radius: 13px;
 }
 #search {
     font-size: 15px; padding: 10px 15px; border-radius: 11px;
-    background: #1d1730; border: 1px solid #3a2c58;
+    background: ${input2}; border: 1px solid ${border2};
 }
-#search:focus { border: 1px solid #ff66ab; }
+#search:focus { border: 1px solid ${accent}; }
 
 /* ---- buttons ---- */
 QPushButton {
-    background: #2a2140; border: 1px solid #3d3059; border-radius: 8px;
-    padding: 6px 13px; color: #e7e0f7;
+    background: ${raise}; border: 1px solid ${border}; border-radius: 8px;
+    padding: 6px 13px; color: ${text_mid};
 }
-QPushButton:hover { background: #342752; border-color: #5a4785; }
-QPushButton:disabled { color: #6b6388; background: #221a33; border-color: #2e2545; }
+QPushButton:hover { background: ${raise2}; border-color: ${border_hi}; }
+QPushButton:disabled { color: ${text_dim}; background: ${surface2}; border-color: ${border2}; }
 QPushButton#primary, QPushButton#dlbtn {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff5fa6, stop:1 #ff86c0);
-    border: none; color: #19101c; font-weight: 700;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 ${accent}, stop:1 ${accent_soft});
+    border: none; color: ${on_accent}; font-weight: 700;
 }
 QPushButton#dlbtn { min-height: 36px; font-size: 14px; }
 QPushButton#primary:hover, QPushButton#dlbtn:hover {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff79b6, stop:1 #ff9bce);
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 ${accent_soft}, stop:1 ${accent_soft});
 }
 QPushButton#dlbtn:disabled {
-    background: #2a2140; color: #8a80aa; border: 1px solid #3d3059;
+    background: ${raise}; color: ${text_dim}; border: 1px solid ${border};
 }
 #card[owned="true"] QPushButton#dlbtn {
-    background: transparent; color: #58e0b0; border: 1px solid #2f5a4e;
+    background: transparent; color: ${owned}; border: 1px solid ${owned_border};
 }
 QPushButton#smallbtn { padding: 5px 11px; font-size: 11px; }
 QPushButton#medalbtn {
-    background: #241c39; border: 1px solid #36e0ff; border-radius: 11px;
-    padding: 9px 15px; font-size: 13px; font-weight: 700; color: #6fe9ff;
+    background: ${input}; border: 1px solid ${accent2}; border-radius: 11px;
+    padding: 9px 15px; font-size: 13px; font-weight: 700; color: ${accent2_soft};
 }
-QPushButton#medalbtn:hover { background: #36e0ff; color: #10131a; }
+QPushButton#medalbtn:hover { background: ${accent2}; color: ${on_accent2}; }
 #packbanner {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2a1733, stop:1 #1a1330);
-    border-bottom: 1px solid #ff66ab;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 ${surface}, stop:1 ${surface2});
+    border-bottom: 1px solid ${accent};
 }
-#packlabel { font-size: 15px; font-weight: 800; color: #ffd45e; }
+#packlabel { font-size: 15px; font-weight: 800; color: ${gold}; }
 
 /* circular preview / web buttons -- the osu! hitcircle motif */
 QToolButton#circbtn {
-    background: #241c39; border: 1px solid #ff66ab; border-radius: 18px;
-    min-width: 36px; min-height: 36px; max-height: 38px; color: #ff8cc4; font-size: 14px;
+    background: ${input}; border: 1px solid ${accent}; border-radius: 18px;
+    min-width: 36px; min-height: 36px; max-height: 38px; color: ${accent_soft}; font-size: 14px;
 }
-QToolButton#circbtn:hover { background: #ff66ab; color: #19101c; }
+QToolButton#circbtn:hover { background: ${accent}; color: ${on_accent}; }
 QToolButton#pillbtn {
-    background: #241c39; border: 1px solid #3d3059; border-radius: 8px;
-    padding: 6px 9px; color: #c3b9e0;
+    background: ${input}; border: 1px solid ${border}; border-radius: 8px;
+    padding: 6px 9px; color: ${text_mid};
 }
-QToolButton#pillbtn:hover { border-color: #36e0ff; color: #36e0ff; }
-QToolButton#xbtn { background: transparent; border: none; color: #8b81ab; padding: 0 4px; font-size: 13px; }
-QToolButton#xbtn:hover { color: #ff5f8f; }
+QToolButton#pillbtn:hover { border-color: ${accent2}; color: ${accent2}; }
+QToolButton#xbtn { background: transparent; border: none; color: ${text_dim}; padding: 0 4px; font-size: 13px; }
+QToolButton#xbtn:hover { color: ${accent}; }
 
 /* ---- identity ---- */
-#logo { color: #ff66ab; font-size: 22px; }
-#wordmark { color: #f1ecfb; font-size: 15px; font-weight: 800; }
+#logo { color: ${accent}; font-size: 22px; }
+#wordmark { color: ${text}; font-size: 15px; font-weight: 800; }
 #neonrule {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 rgba(255,102,171,0), stop:0.5 #ff66ab, stop:1 rgba(54,224,255,0.0));
+        stop:0 rgba(0,0,0,0), stop:0.5 ${accent}, stop:1 rgba(0,0,0,0));
     max-height: 2px; min-height: 2px; border: none;
 }
 
 /* ---- downloads dock (bottom) ---- */
-#dock { background: #0e0a18; border-top: 1px solid #2c2344; }
+#dock { background: ${bg_deep}; border-top: 1px solid ${border2}; }
 QScrollArea#dockscroll { background: transparent; }
-#panelhead { font-size: 15px; font-weight: 800; color: #ffffff; }
-#dockempty { color: #6f6790; font-size: 13px; }
+#panelhead { font-size: 15px; font-weight: 800; color: ${text_bright}; }
+#dockempty { color: ${text_faint}; font-size: 13px; }
 QPushButton#dockbtn {
-    background: #2a2140; border: 1px solid #3d3059; border-radius: 9px;
-    padding: 9px 17px; font-size: 13px; font-weight: 600; color: #e7e0f7;
+    background: ${raise}; border: 1px solid ${border}; border-radius: 9px;
+    padding: 9px 17px; font-size: 13px; font-weight: 600; color: ${text_mid};
 }
-QPushButton#dockbtn:hover { background: #36285a; border-color: #5a4785; }
+QPushButton#dockbtn:hover { background: ${raise2}; border-color: ${border_hi}; }
 #dlrow {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #221a35, stop:1 #1b1530);
-    border: 1px solid #342a4d; border-radius: 11px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 ${surface}, stop:1 ${surface2});
+    border: 1px solid ${border2}; border-radius: 11px;
 }
-#dlname { font-size: 12px; color: #e7e0f7; }
-#dlstatus { color: #8b81ab; font-size: 11px; }
-QProgressBar { background: #2a2140; border: none; border-radius: 3px; }
+#dlname { font-size: 12px; color: ${text_mid}; }
+#dlstatus { color: ${text_dim}; font-size: 11px; }
+QProgressBar { background: ${raise}; border: none; border-radius: 3px; }
 QProgressBar::chunk {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff66ab, stop:1 #36e0ff);
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 ${accent}, stop:1 ${accent2});
     border-radius: 3px;
 }
 
 /* ---- chrome ---- */
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ff66ab, stop:1 #b14bd0);
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 ${accent}, stop:1 ${scroll2});
     border-radius: 5px; min-height: 36px;
 }
-QScrollBar::handle:vertical:hover { background: #ff85c0; }
+QScrollBar::handle:vertical:hover { background: ${accent_soft}; }
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
-QStatusBar { background: #0c0813; border-top: 1px solid #271f3c; }
+QStatusBar { background: ${bg_deep}; border-top: 1px solid ${border2}; }
 QStatusBar::item { border: none; }
-QStatusBar QLabel { color: #b3a9d0; }
-#hint { color: #8b81ab; font-size: 11px; }
-QSplitter::handle { background: #271f3c; width: 1px; }
-QCheckBox { color: #d6cdf0; spacing: 8px; font-size: 12px; }
+QStatusBar QLabel { color: ${text_mid}; }
+#hint { color: ${text_dim}; font-size: 11px; }
+QSplitter::handle { background: ${border2}; width: 1px; }
+QCheckBox { color: ${text_mid}; spacing: 8px; font-size: 12px; }
 QCheckBox::indicator {
     width: 18px; height: 18px; border-radius: 5px;
-    border: 1px solid #3d3059; background: #241c39;
+    border: 1px solid ${border}; background: ${input};
 }
-QCheckBox::indicator:hover { border: 1px solid #ff66ab; }
-QCheckBox::indicator:checked { background: #ff66ab; border-color: #ff66ab; }
-QToolTip { background: #1d1730; color: #f1ecfb; border: 1px solid #ff66ab; padding: 4px 7px; }
-QSlider::groove:horizontal { height: 4px; background: #2a2140; border-radius: 2px; }
+QCheckBox::indicator:hover { border: 1px solid ${accent}; }
+QCheckBox::indicator:checked { background: ${accent}; border-color: ${accent}; }
+QToolTip { background: ${input2}; color: ${text}; border: 1px solid ${accent}; padding: 4px 7px; }
+QSlider::groove:horizontal { height: 4px; background: ${raise}; border-radius: 2px; }
 QSlider::sub-page:horizontal {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff66ab, stop:1 #36e0ff); border-radius: 2px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 ${accent}, stop:1 ${accent2}); border-radius: 2px;
 }
 QSlider::handle:horizontal {
-    background: #ffffff; width: 12px; height: 12px; margin: -5px 0; border-radius: 6px;
+    background: ${text_bright}; width: 12px; height: 12px; margin: -5px 0; border-radius: 6px;
 }
 """
 
-# Accent themes. Each swaps the two signature accents (primary "pink" #ff66ab and
-# secondary "cyan" #36e0ff) throughout the stylesheet; the deep-indigo base and the
-# status colours stay put. "synthwave" is the original look.
-ACCENTS = [
-    ("Synthwave (pink · cyan)", "synthwave"),
-    ("Sunset (coral · gold)", "sunset"),
-    ("Vaporwave (violet · aqua)", "vapor"),
-    ("Matrix (green · mint)", "matrix"),
-    ("Ice (blue · sky)", "ice"),
+# ---- theme engine ----------------------------------------------------------
+# Each theme is four seed colours -- (background, surface, accent, accent2) --
+# from which _derive_palette() builds every token above. Add a theme by adding
+# one line to THEMES / THEME_SEEDS; the whole UI recolours coherently.
+def _hex2rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _rgb2hex(rgb):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, round(c))) for c in rgb)
+
+
+def _mix(a, b, t):
+    ra, rb = _hex2rgb(a), _hex2rgb(b)
+    return _rgb2hex(tuple(ra[i] + (rb[i] - ra[i]) * t for i in range(3)))
+
+
+def _lighten(c, t):
+    return _mix(c, "#ffffff", t)
+
+
+def _darken(c, t):
+    return _mix(c, "#000000", t)
+
+
+def _lum(c):
+    r, g, b = _hex2rgb(c)
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+
+
+def _readable_on(c):
+    """Dark ink on a light/bright colour, white on a dark one."""
+    return "#141019" if _lum(c) > 0.5 else "#ffffff"
+
+
+def _derive_palette(bg, surface, accent, accent2, owned="#5be3b0", gold="#ffd45e"):
+    return {
+        "bg": bg,
+        "bg_deep": _darken(bg, 0.30),
+        "bg2": _lighten(bg, 0.05),
+        "surface": surface,
+        "surface2": _darken(surface, 0.16),
+        "input": _darken(surface, 0.05),
+        "input2": _darken(surface, 0.13),
+        "raise": _lighten(surface, 0.05),
+        "raise2": _lighten(surface, 0.15),
+        "border": _lighten(surface, 0.16),
+        "border2": _lighten(surface, 0.07),
+        "border_hi": _mix(_lighten(surface, 0.20), accent, 0.40),
+        "text": _mix("#ffffff", surface, 0.10),
+        "text_bright": "#ffffff",
+        "text_mid": _mix("#ffffff", surface, 0.30),
+        "text_dim": _mix("#ffffff", surface, 0.50),
+        "text_faint": _mix("#ffffff", surface, 0.62),
+        "accent": accent,
+        "accent_soft": _lighten(accent, 0.18),
+        "accent2": accent2,
+        "accent2_soft": _lighten(accent2, 0.20),
+        "on_accent": _readable_on(accent),
+        "on_accent2": _readable_on(accent2),
+        "cover_a": _mix(surface, accent, 0.18),
+        "cover_b": _mix(surface, accent, 0.36),
+        "scroll2": _mix(accent, accent2, 0.5),
+        "gold": gold,
+        "owned": owned,
+        "owned_border": _mix(_darken(surface, 0.04), owned, 0.32),
+        "owned_surface": _mix(surface, owned, 0.10),
+        "owned_surface2": _darken(_mix(surface, owned, 0.10), 0.14),
+    }
+
+
+# label, key -- shown in Settings, in menu order.
+THEMES = [
+    ("Synthwave", "synthwave"),
+    ("Sunset", "sunset"),
+    ("Vaporwave", "vapor"),
+    ("Matrix", "matrix"),
+    ("Ice", "ice"),
+    ("Ember", "ember"),
+    ("Deep Sea", "deepsea"),
+    ("Forest", "forest"),
+    ("Dracula", "dracula"),
+    ("Royal Gold", "royal"),
+    ("Carbon", "carbon"),
+    ("Rose Gold", "rosegold"),
+    ("Neon Yellow", "neon"),
+    ("Bubblegum", "bubblegum"),
+    ("Blood Moon", "bloodmoon"),
+    ("Aurora", "aurora"),
 ]
-ACCENT_COLORS = {
-    "synthwave": ("#ff66ab", "#36e0ff"),
-    "sunset":    ("#ff7a59", "#ffd166"),
-    "vapor":     ("#c774e8", "#41ead4"),
-    "matrix":    ("#39ff14", "#9dffce"),
-    "ice":       ("#5b9dff", "#8ee3ff"),
+# key -> (bg, surface, accent, accent2)
+THEME_SEEDS = {
+    "synthwave": ("#100c1a", "#221a35", "#ff66ab", "#36e0ff"),
+    "sunset":    ("#1a0f14", "#301b26", "#ff7a59", "#ffce54"),
+    "vapor":     ("#140f1e", "#271a3a", "#c774e8", "#41ead4"),
+    "matrix":    ("#08120b", "#122419", "#39ff77", "#9dffce"),
+    "ice":       ("#0b1220", "#172636", "#5b9dff", "#8ee3ff"),
+    "ember":     ("#160b0b", "#2b1616", "#ff5a4a", "#ffb347"),
+    "deepsea":   ("#08131a", "#10232e", "#22c7cf", "#4de3d0"),
+    "forest":    ("#0b140c", "#182a1c", "#7bd88f", "#d4e08a"),
+    "dracula":   ("#191322", "#2a2440", "#bd93f9", "#ff79c6"),
+    "royal":     ("#14110a", "#2a2416", "#e6c34d", "#9d8bff"),
+    "carbon":    ("#0e0e12", "#20212b", "#cfd3e0", "#8f93a8"),
+    "rosegold":  ("#170f10", "#2c1e22", "#f6a6b2", "#e8c07d"),
+    "neon":      ("#0e0f06", "#22240f", "#f6ff2a", "#22d3ff"),
+    "bubblegum": ("#150f16", "#2b1d33", "#ff8fd4", "#7cf0ff"),
+    "bloodmoon": ("#140a0d", "#291320", "#ff3b6b", "#ff9e64"),
+    "aurora":    ("#0a1016", "#152430", "#64ffda", "#a78bfa"),
 }
-PRIMARY_ACCENT = "#ff66ab"
-SECONDARY_ACCENT = "#36e0ff"
+
+from string import Template as _StyleTemplate
+
+_STYLE_TMPL = _StyleTemplate(STYLE)
+# Current accent hexes, updated by themed_style(); used for glow/wordmark that
+# aren't part of the stylesheet. Defaults keep the original look pre-first-theme.
+ACCENT_HEX = "#ff66ab"
+ACCENT2_HEX = "#36e0ff"
+# Back-compat alias: Settings reads ACCENTS as (label, key) pairs.
+ACCENTS = THEMES
 
 
-def themed_style(accent_key: str) -> str:
-    """The stylesheet recoloured for the chosen accent (falls back to synthwave)."""
-    pink, cyan = ACCENT_COLORS.get(accent_key, ACCENT_COLORS["synthwave"])
-    if (pink, cyan) == (PRIMARY_ACCENT, SECONDARY_ACCENT):
-        return STYLE
-    return STYLE.replace(PRIMARY_ACCENT, pink).replace(SECONDARY_ACCENT, cyan)
+def themed_style(theme_key: str) -> str:
+    """Full stylesheet for a theme. Also refreshes the module-level accent hexes
+    used by the glow effect and wordmark."""
+    global ACCENT_HEX, ACCENT2_HEX
+    seeds = THEME_SEEDS.get(theme_key) or THEME_SEEDS["synthwave"]
+    ACCENT_HEX, ACCENT2_HEX = seeds[2], seeds[3]
+    return _STYLE_TMPL.substitute(_derive_palette(*seeds))
 
 
 def resource_path(name: str) -> str:
