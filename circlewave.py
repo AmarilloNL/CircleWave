@@ -61,7 +61,10 @@ import time
 import json
 import math
 import hashlib
+import logging
 import tempfile
+import threading
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -142,15 +145,15 @@ class ImageWorker(QRunnable):
             if cache_file.exists():
                 self.signals.done.emit(self.setid, cache_file.read_bytes())
                 return
-            r = requests.get(self.url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+            r = SESSION.get(self.url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
             if r.status_code == 200 and r.content:
                 try:
                     cache_file.write_bytes(r.content)
-                except OSError:
-                    pass
+                except OSError as e:
+                    log.debug("cover cache write failed for %s: %s", self.setid, e)
                 self.signals.done.emit(self.setid, r.content)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 - a missing cover is non-fatal
+            log.debug("cover fetch failed for %s: %s", self.setid, e)
 
 
 class DownloadSignals(QObject):
@@ -167,10 +170,33 @@ class DownloadWorker(QRunnable):
         self.no_video = no_video
         self.mirrors = mirrors
         self.signals = DownloadSignals()
-        self.cancelled = False
+        # threading.Event, not a bare bool: the flag is set from the GUI thread
+        # and read from the worker thread, and Event makes that hand-off explicit.
+        self._cancel = threading.Event()
 
     def cancel(self):
-        self.cancelled = True
+        self._cancel.set()
+
+    @property
+    def cancelled(self) -> bool:      # kept for callers that inspect the flag
+        return self._cancel.is_set()
+
+    @staticmethod
+    def _looks_like_zip(path: Path) -> bool:
+        """A complete .osz is a zip; is_zipfile validates the central directory,
+        so it also rejects truncated (interrupted) downloads and HTML error pages."""
+        try:
+            return zipfile.is_zipfile(path)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _discard(*paths: Path):
+        for p in paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @Slot()
     def run(self):
@@ -181,31 +207,55 @@ class DownloadWorker(QRunnable):
         dest = dest_dir / fname
         # Stage the partial file *inside* the destination dir so the final move
         # is a same-filesystem atomic rename (avoids cross-device errors when the
-        # system temp dir is a tmpfs and the download folder is on disk).
+        # system temp dir is a tmpfs and the download folder is on disk). A sidecar
+        # .part.url records which mirror URL produced the partial, so a resume only
+        # ever extends a partial from the *same* URL (mirrors aren't interchangeable).
         tmp = dest_dir / (fname + ".part")
+        meta = dest_dir / (fname + ".part.url")
         last_err = "no mirror succeeded"
 
         for mirror in self.mirrors:
-            if self.cancelled:
+            if self._cancel.is_set():
                 self.signals.failed.emit(sid, "cancelled")
                 return
             url = mirror["novideo"] if (self.no_video and mirror["novideo"]) else mirror["full"]
             url = url.format(id=sid)
-            self.signals.progress.emit(sid, -1, f"trying {mirror['name']}\u2026")
+
+            # Resume only if we have a partial tagged with this exact URL.
+            resume_from = 0
+            if tmp.exists() and meta.exists() and _read_text(meta) == url:
+                resume_from = tmp.stat().st_size
+            else:
+                self._discard(tmp, meta)   # stale / foreign partial
+
+            headers = {"User-Agent": DOWNLOAD_UA}
+            if resume_from:
+                headers["Range"] = f"bytes={resume_from}-"
+            note = "resuming" if resume_from else "trying"
+            self.signals.progress.emit(sid, -1, f"{note} {mirror['name']}\u2026")
+
             try:
-                with requests.get(url, headers={"User-Agent": DOWNLOAD_UA},
-                                  stream=True, timeout=HTTP_TIMEOUT, allow_redirects=True) as r:
+                with SESSION.get(url, headers=headers, stream=True,
+                                 timeout=HTTP_TIMEOUT, allow_redirects=True) as r:
                     ctype = r.headers.get("Content-Type", "").lower()
-                    if r.status_code != 200 or "text/html" in ctype or "json" in ctype:
+                    if r.status_code not in (200, 206) or "text/html" in ctype or "json" in ctype:
                         last_err = f"{mirror['name']} HTTP {r.status_code}"
+                        self._discard(tmp, meta)      # response body is not an .osz
                         continue
-                    total = int(r.headers.get("Content-Length", 0) or 0)
-                    got = 0
-                    with open(tmp, "wb") as fh:
+
+                    if r.status_code == 206 and resume_from:
+                        mode, got = "ab", resume_from            # server honoured Range
+                        total = resume_from + int(r.headers.get("Content-Length", 0) or 0)
+                    else:                                        # full body (Range ignored / fresh)
+                        mode, got, resume_from = "wb", 0, 0
+                        total = int(r.headers.get("Content-Length", 0) or 0)
+
+                    meta.write_text(url)
+                    with open(tmp, mode) as fh:
                         for chunk in r.iter_content(chunk_size=65536):
-                            if self.cancelled:
-                                fh.close()
-                                tmp.unlink(missing_ok=True)
+                            if self._cancel.is_set():
+                                fh.flush()
+                                # Keep tmp + meta so this mirror can resume later.
                                 self.signals.failed.emit(sid, "cancelled")
                                 return
                             if chunk:
@@ -213,18 +263,29 @@ class DownloadWorker(QRunnable):
                                 got += len(chunk)
                                 pct = int(got * 100 / total) if total else -1
                                 self.signals.progress.emit(sid, pct, mirror["name"])
-                    if got < 1024:  # almost certainly an error page
-                        last_err = f"{mirror['name']} returned {got} bytes"
-                        tmp.unlink(missing_ok=True)
+
+                    if got < 1024 or not self._looks_like_zip(tmp):
+                        last_err = f"{mirror['name']} returned an invalid/partial file"
+                        self._discard(tmp, meta)
                         continue
                     tmp.replace(dest)
+                    self._discard(meta)
                     self.signals.done.emit(sid, str(dest))
                     return
             except Exception as e:  # noqa: BLE001
+                # Network hiccup: keep the partial so the same mirror can resume.
+                log.warning("download %s via %s failed: %s", sid, mirror["name"], e)
                 last_err = f"{mirror['name']}: {e}"
                 continue
 
         self.signals.failed.emit(sid, last_err)
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text()
+    except OSError:
+        return ""
 
 
 def sanitize_filename(name: str) -> str:
@@ -1701,6 +1762,7 @@ class MainWindow(QMainWindow):
         try:
             status = upsert_collection(db_path, pk["medal"], hashes)
         except Exception as e:  # noqa: BLE001
+            log.exception("collection write to %s failed", db_path)
             QMessageBox.critical(self, "Collection error",
                                  f"Couldn't write the collection:\n{type(e).__name__}: {e}")
             return
@@ -2152,14 +2214,21 @@ def resource_path(name: str) -> str:
 
 
 def main():
+    # Logging goes to stderr. Level defaults to WARNING; set CIRCLEWAVE_LOG=DEBUG
+    # (or INFO) to see mirror fallbacks, cover/download failures, etc.
+    logging.basicConfig(
+        level=os.environ.get("CIRCLEWAVE_LOG", "WARNING").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
     # Make Windows show our own taskbar icon instead of grouping under python.exe.
     if sys.platform == "win32":
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
                 f"{ORG_NAME}.{APP_NAME}")
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("could not set Windows AppUserModelID: %s", e)
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)

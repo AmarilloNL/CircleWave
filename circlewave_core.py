@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import time
 import hashlib
 import logging
 import threading
@@ -23,8 +24,60 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+
+try:                                    # urllib3 ships with requests; guard anyway
+    from urllib3.util.retry import Retry
+except Exception:                       # pragma: no cover
+    Retry = None
 
 log = logging.getLogger("circlewave")
+
+
+# ----------------------------------------------------------------------------
+# HTTP SESSION
+# ----------------------------------------------------------------------------
+# One shared session for the whole app: keep-alive connection pooling speeds up
+# the many sequential search / pack / metadata requests, and an automatic
+# retry/backoff handles the transient failures mirrors love to throw (429 rate
+# limits, 502/503 while a node restarts). Use SESSION.get(...) everywhere instead
+# of requests.get(...).
+def _build_session() -> requests.Session:
+    s = requests.Session()
+    if Retry is not None:
+        retry = Retry(
+            total=3, connect=3, read=3,
+            backoff_factor=0.5,                        # waits 0.5s, 1s, 2s
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"]),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=16)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+    return s
+
+
+SESSION = _build_session()
+
+# Politeness throttle for the osu.ppy.sh website (pack listings, pack pages,
+# most-played). Those are scraped from the public site rather than a mirror API,
+# so we self-limit to avoid hammering it -- especially when bulk-loading the
+# ~3,750 packs across categories. Mirror/API hosts are not throttled.
+_OSU_MIN_INTERVAL = 0.5                  # seconds between osu.ppy.sh requests
+_osu_lock = threading.Lock()
+_osu_last = 0.0
+
+
+def _osu_throttle():
+    """Block just long enough to keep osu.ppy.sh requests >= _OSU_MIN_INTERVAL apart."""
+    global _osu_last
+    with _osu_lock:
+        wait = _OSU_MIN_INTERVAL - (time.monotonic() - _osu_last)
+        if wait > 0:
+            time.sleep(wait)
+        _osu_last = time.monotonic()
 
 
 # ----------------------------------------------------------------------------
@@ -409,7 +462,7 @@ def _has_client_filter(f: dict) -> bool:
 
 def _fetch_search_page(base: dict, page: int, ps: int) -> list:
     params = dict(base, p=page, ps=ps)
-    r = requests.get(NERINYAN_SEARCH, params=params,
+    r = SESSION.get(NERINYAN_SEARCH, params=params,
                      headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     data = r.json()
@@ -420,7 +473,7 @@ def fetch_card_meta(set_id: int) -> tuple:
     """Fetch full osu!-web metadata for one set from osu.direct (BPM, play and
     favourite counts, accurate per-diff data) to enrich a hinamizawa card.
     Returns (set_id, Beatmapset)."""
-    r = requests.get(OSU_DIRECT_SET.format(id=set_id),
+    r = SESSION.get(OSU_DIRECT_SET.format(id=set_id),
                      headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     data = r.json()
@@ -437,7 +490,8 @@ def search_beatmapsets(filters: dict, token) -> tuple:
     the app keeps working."""
     try:
         return _search_hinamizawa(filters, token)
-    except Exception:
+    except Exception as e:
+        log.info("hinamizawa search failed (%s); falling back to nerinyan", e)
         if token is None:                  # fall back only on a fresh search; a
             return _search_nerinyan(filters, None)   # paging token isn't portable
         return [], None
@@ -449,7 +503,7 @@ def _hina_get(params: dict, status_code=None) -> list:
     RankedStatus field is unreliable, so the queried code is authoritative)."""
     if status_code is not None:
         params = dict(params, status=status_code)
-    r = requests.get(HINA_SEARCH, params=params,
+    r = SESSION.get(HINA_SEARCH, params=params,
                      headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     data = r.json()
@@ -650,7 +704,10 @@ def load_history(path: Path) -> set:
     """Load the persistent set of set-ids downloaded through this app."""
     try:
         return {int(x) for x in json.loads(Path(path).read_text())}
-    except Exception:  # noqa: BLE001 - missing/corrupt file is fine
+    except FileNotFoundError:
+        return set()
+    except Exception as e:  # noqa: BLE001 - corrupt file shouldn't crash the app
+        log.warning("could not read download history %s: %s", path, e)
         return set()
 
 
@@ -883,7 +940,8 @@ def parse_pack_list(html_text: str) -> list:
 def fetch_pack_list(pack_type: str, page: int) -> list:
     """Fetch one listing page (100 packs, newest first). Empty list = past the end."""
     url = PACK_LIST_URL.format(type=pack_type, page=page)
-    r = requests.get(url, headers={"User-Agent": DOWNLOAD_UA}, timeout=HTTP_TIMEOUT)
+    _osu_throttle()
+    r = SESSION.get(url, headers={"User-Agent": DOWNLOAD_UA}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return parse_pack_list(r.text)
 
@@ -892,7 +950,8 @@ def fetch_most_played(username: str, limit: int) -> tuple:
     """Resolve a username/ID and return (username, [Beatmapset, ...]) for their
     most-played maps, deduped to beatmapsets and ordered by total play count.
     Uses the public profile JSON route -- no login or API key."""
-    prof = requests.get(USER_PROFILE_URL.format(user=username),
+    _osu_throttle()
+    prof = SESSION.get(USER_PROFILE_URL.format(user=username),
                         headers={"User-Agent": DOWNLOAD_UA}, timeout=HTTP_TIMEOUT)
     prof.raise_for_status()
     m = re.search(r"/users/(\d+)", prof.url)
@@ -904,7 +963,8 @@ def fetch_most_played(username: str, limit: int) -> tuple:
     sets, order, scanned, offset = {}, [], 0, 0
     while scanned < limit:
         n = min(MOST_PLAYED_PAGE, limit - scanned)
-        rr = requests.get(MOST_PLAYED_URL.format(id=uid, limit=n, offset=offset),
+        _osu_throttle()
+        rr = SESSION.get(MOST_PLAYED_URL.format(id=uid, limit=n, offset=offset),
                           headers=hdr, timeout=HTTP_TIMEOUT)
         rr.raise_for_status()
         batch = rr.json()
@@ -931,7 +991,7 @@ def fetch_most_played(username: str, limit: int) -> tuple:
 
 def fetch_pack_medals() -> list:
     """Download the wiki table and return the medal -> pack-tag list."""
-    r = requests.get(MEDAL_WIKI_URL, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+    r = SESSION.get(MEDAL_WIKI_URL, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     medals = parse_pack_medals(r.text)
     if not medals:
@@ -945,7 +1005,8 @@ def fetch_pack_contents(tags: list) -> list:
     for tag in tags:
         url = PACK_PAGE_URL.format(tag=tag)
         # browser UA: the pack pages are public but reject obvious bots
-        r = requests.get(url, headers={"User-Agent": DOWNLOAD_UA}, timeout=HTTP_TIMEOUT)
+        _osu_throttle()
+        r = SESSION.get(url, headers={"User-Agent": DOWNLOAD_UA}, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         for sid, name in parse_pack_page(r.text):
             if sid not in seen:
