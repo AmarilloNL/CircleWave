@@ -58,28 +58,31 @@ import os
 import re
 import sys
 import time
-import json
-import math
-import hashlib
+import random
+import logging
 import tempfile
-from dataclasses import dataclass, field
+import threading
+import zipfile
 from pathlib import Path
-from typing import Optional
-
-import requests
+# Config, data model, networking, collection.db and parsers live in
+# circlewave_core (see the star-import just below the Qt imports).
 
 from PySide6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, Signal, Slot, QSize, QUrl, QRect,
-    QPoint, QTimer, QSettings,
+    QPoint, QTimer, QSettings, QStringListModel,
 )
-from PySide6.QtGui import QPixmap, QDesktopServices, QFont, QFontMetrics, QIcon, QColor
+from PySide6.QtGui import (
+    QPixmap, QDesktopServices, QFont, QFontMetrics, QIcon, QColor,
+    QShortcut, QKeySequence, QAction,
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit,
     QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QHBoxLayout, QVBoxLayout,
     QGridLayout, QFormLayout, QScrollArea, QFrame, QSizePolicy, QLayout,
     QToolButton, QProgressBar, QDialog, QDialogButtonBox, QFileDialog,
     QMessageBox, QSplitter, QStatusBar, QStyle, QSlider, QGraphicsDropShadowEffect,
-    QListWidget, QListWidgetItem,
+    QListWidget, QListWidgetItem, QInputDialog, QAbstractItemView, QMenu,
+    QSystemTrayIcon,
 )
 
 # QtMultimedia is optional (preview audio). Degrade gracefully if codecs missing.
@@ -90,950 +93,12 @@ except Exception:  # pragma: no cover
     HAS_MULTIMEDIA = False
 
 
-# ----------------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------------
-# Branding. APP_TITLE is the one place to change the product name -- it drives
-# the window title and the header wordmark.
-APP_TITLE = "Circlewave"
-APP_VERSION = "1.2.1"
-APP_TAGLINE = "osu! beatmap browser & downloader"
-ORG_NAME = "AmarilloNL"
-APP_NAME = "Circlewave"
-
-NERINYAN_SEARCH = "https://api.nerinyan.moe/search"   # POST JSON body; returns osu!-web array
-# Hinamizawa mirror search: complete index (incl. maps Nerinyan lacks), clean
-# relevance, server-side genre/language/status/bpm/star filters. CheeseGull-style
-# response. No working pagination and no BPM/play-count fields -- so it's used for
-# field-scoped searches and genre/language filters, with Nerinyan for plain browse.
-HINA_SEARCH = "https://mirror.hinamizawa.ai/api/v1/hinai/search"
-HINA_AMOUNT = 100                # page size; paginates via the `offset` param
-# hinamizawa's search has no BPM / play counts; osu.direct returns full osu!-web
-# data for any set, so visible hinamizawa cards are enriched from it on demand.
-OSU_DIRECT_SET = "https://osu.direct/api/v2/s/{id}"
-PREVIEW_URL = "https://b.ppy.sh/preview/{id}.mp3"
-WEB_SET_URL = "https://osu.ppy.sh/beatmapsets/{id}"
-
-# Beatmap-pack medal data. The medal->pack mapping lives in the osu! wiki (mirrored
-# on GitHub raw, which isn't bot-gated); pack contents come from the public pack page.
-MEDAL_WIKI_URL = ("https://raw.githubusercontent.com/ppy/osu-wiki/master/"
-                  "wiki/Medals/Unlock_requirements/Beatmap_packs/en.md")
-PACK_PAGE_URL = "https://osu.ppy.sh/beatmaps/packs/{tag}"
-# Pack listing (newest first, 100 per page). Categories use osu!'s `type` values.
-PACK_LIST_URL = "https://osu.ppy.sh/beatmaps/packs?type={type}&page={page}"
-PACK_TYPES = [
-    ("Standard", "standard"), ("Featured Artist", "featured"),
-    ("Tournament", "tournament"), ("Project Loved", "loved"),
-    ("Spotlights", "chart"), ("Theme", "theme"), ("Artist/Album", "artist"),
-]
-PACK_PAGE_COUNT = 100          # packs per listing page
-# A user's most-played beatmaps (public; no auth). The profile URL redirects to
-# /users/{id}, and the website's own JSON route serves the most-played list.
-USER_PROFILE_URL = "https://osu.ppy.sh/users/{user}"
-MOST_PLAYED_URL = "https://osu.ppy.sh/users/{id}/beatmapsets/most_played?limit={limit}&offset={offset}"
-MOST_PLAYED_PAGE = 51          # the route caps a single request at 51
-
-PAGE_SIZE = 50
-# When a search is narrowed client-side (field scope, BPM / star / length range),
-# we pull a much bigger page so 1-2 requests gather enough matches instead of ~20
-# sequential 50-result pages. The mirror caps ps at 1000; only matched cards are
-# rendered, so the rest is just discarded JSON.
-FILTER_PAGE_SIZE = 250
-# Field-scoped searches (Search in -> Artist/Title/...) can't be filtered by the
-# server, so we fetch the whole bounded `q` result set in max-size pages and
-# filter locally. ps maxes at 1000 on the mirror; a few pages covers any artist.
-FIELD_SEARCH_PS = 1000
-FIELD_SEARCH_MAX_PAGES = 5
-HTTP_TIMEOUT = 30
-USER_AGENT = "osu-beatmap-downloader/1.0 (+personal use)"
-# Some mirrors (catboy, beatconnect) gate non-browser clients; use a browser UA
-# for the actual file downloads so those fallbacks work for e.g. graveyard maps.
-DOWNLOAD_UA = ("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
-
-# Download mirrors, tried top-to-bottom. Each entry: name, full url, no-video url.
-# {id} is substituted with the beatmapset id.
-MIRRORS = [
-    {"name": "nerinyan",   "full": "https://api.nerinyan.moe/d/{id}",                      "novideo": "https://api.nerinyan.moe/d/{id}?noVideo=true"},
-    {"name": "catboy",     "full": "https://catboy.best/d/{id}",                           "novideo": "https://catboy.best/d/{id}?n=1"},
-    {"name": "beatconnect","full": "https://beatconnect.io/b/{id}",                        "novideo": None},
-    # Sayobot is China-hosted and slow/throttled from outside CN, so it's the last resort.
-    {"name": "sayobot",    "full": "https://dl.sayobot.cn/beatmaps/download/full/{id}",    "novideo": "https://dl.sayobot.cn/beatmaps/download/novideo/{id}"},
-]
-
-MODES = [("Any", None), ("osu!", 0), ("taiko", 1), ("catch", 2), ("mania", 3)]
-MODE_NAME = {"osu": "osu!", "taiko": "taiko", "fruits": "catch", "mania": "mania"}
-
-STATUSES = [
-    ("Any", "all"), ("Ranked", "ranked"), ("Qualified", "qualified"),
-    ("Loved", "loved"), ("Pending", "pending"), ("WIP", "wip"),
-    ("Graveyard", "graveyard"),
-]
-
-SORTS = [
-    ("Ranked (newest)", "ranked_desc"),
-    ("Ranked (oldest)", "ranked_asc"),
-    ("Title (A-Z)", "title_asc"),
-    ("Title (Z-A)", "title_desc"),
-    ("Artist (A-Z)", "artist_asc"),
-    ("Most played", "plays_desc"),
-    ("Most favourited", "favourites_desc"),
-    ("Recently updated", "updated_desc"),
-]
-
-# Which field(s) the text query matches. Maps to Nerinyan's `option` param;
-# "" = all fields (relevance-less, so a bare mapper name pulls in tag matches),
-# "creator" = mapper only -> the reliable way to find a mapper's maps.
-SEARCH_FIELDS = [
-    ("Everything", ""),
-    ("Mapper", "creator"),
-    ("Title", "title"),
-    ("Artist", "artist"),
-    ("Tags", "tag"),
-]
-
-# osu! genre / language ids (used by the hinamizawa mirror's genre=/language= params).
-GENRES = [
-    ("Any genre", 0), ("Video Game", 2), ("Anime", 3), ("Rock", 4), ("Pop", 5),
-    ("Other", 6), ("Novelty", 7), ("Hip Hop", 9), ("Electronic", 10),
-    ("Metal", 11), ("Classical", 12), ("Folk", 13), ("Jazz", 14),
-    ("Unspecified", 1),
-]
-LANGUAGES = [
-    ("Any language", 0), ("English", 2), ("Japanese", 3), ("Chinese", 4),
-    ("Instrumental", 5), ("Korean", 6), ("French", 7), ("German", 8),
-    ("Swedish", 9), ("Spanish", 10), ("Italian", 11), ("Russian", 12),
-    ("Polish", 13), ("Other", 14), ("Unspecified", 1),
-]
-# Map our status strings <-> hinamizawa's numeric RankedStatus.
-# Map our status strings to hinamizawa numeric RankedStatus codes. "Ranked"
-# bundles ranked(1)+approved(2), matching how osu! and the mirror's own UI treat
-# it (sent as a comma list); "Any" omits the param.
-HINA_STATUS = {"all": [1, 3, 4, 0, -2],          # distinct buckets only (2==1, -1==0)
-               "ranked": [1], "qualified": [3], "loved": [4],
-               "pending": [0], "wip": [-1], "graveyard": [-2]}
-# The mirror's response RankedStatus is coarse/unreliable (only 0/1), so we tag
-# each result with the status code we *queried* instead -- that's authoritative.
-HINA_CODE_STATUS = {1: "ranked", 2: "approved", 3: "qualified", 4: "loved",
-                    0: "pending", -1: "wip", -2: "graveyard"}
-HINA_STATUS_REV = {1: "ranked", 2: "approved", 3: "qualified", 4: "loved",
-                   0: "pending", -1: "wip", -2: "graveyard"}
-# Our sort keys -> the mirror's `sort` values (it has no asc/desc variants).
-HINA_SORT = {k: k for k in (        # the mirror takes "{field}_{asc|desc}" directly,
-    "ranked_desc", "ranked_asc",    # which is exactly our SORTS key format, so each
-    "title_asc", "title_desc",      # key passes through unchanged (real A-Z/Z-A and
-    "artist_asc",                   # newest/oldest). Unknown keys are dropped.
-    "plays_desc", "favourites_desc", "updated_desc")}
-HINA_MODE = {0: "osu", 1: "taiko", 2: "fruits", 3: "mania"}
-
-# Preset ranges for the BPM / Stars dropdowns. Each value is (min, max); 0 = open.
-BPM_RANGES = [
-    ("Any BPM", (0, 0)),
-    ("Under 120", (0, 120)),
-    ("120 \u2013 150", (120, 150)),
-    ("150 \u2013 180", (150, 180)),
-    ("180 \u2013 200", (180, 200)),
-    ("200 \u2013 240", (200, 240)),
-    ("240+", (240, 0)),
-]
-LENGTH_RANGES = [
-    ("Any length", (0, 0)),
-    ("Under 1 min", (0, 60)),
-    ("1 \u2013 2 min", (60, 120)),
-    ("2 \u2013 3 min", (120, 180)),
-    ("3 \u2013 5 min", (180, 300)),
-    ("5 \u2013 7 min", (300, 420)),
-    ("Over 7 min", (420, 0)),
-]
-STAR_RANGES = [
-    ("Any difficulty", (0, 0)),
-    ("Easy  \u00b7  0\u20132\u2605", (0, 2)),
-    ("Normal  \u00b7  2\u20132.7\u2605", (2, 2.7)),
-    ("Hard  \u00b7  2.7\u20134\u2605", (2.7, 4)),
-    ("Insane  \u00b7  4\u20135.3\u2605", (4, 5.3)),
-    ("Expert  \u00b7  5.3\u20136.5\u2605", (5.3, 6.5)),
-    ("Expert+  \u00b7  6.5\u2605+", (6.5, 0)),
-    ("7\u2605 and up", (7, 0)),
-    ("8\u2605 and up", (8, 0)),
-    ("9\u2605 and up", (9, 0)),
-    ("10\u2605 and up", (10, 0)),
-]
-
-STATUS_COLORS = {
-    "ranked": "#7ac74f", "approved": "#7ac74f", "loved": "#ff66aa",
-    "qualified": "#3a7bd5", "pending": "#e0a23a", "wip": "#e0a23a",
-    "graveyard": "#8a8a8a", "pack": "#ff66ab",
-}
-
-
-# ----------------------------------------------------------------------------
-# DATA MODEL
-# ----------------------------------------------------------------------------
-@dataclass
-class Diff:
-    mode: str
-    sr: float
-    bpm: float
-    length: int
-    version: str
-
-
-@dataclass
-class Beatmapset:
-    id: int
-    title: str
-    artist: str
-    creator: str
-    status: str
-    bpm: float
-    play_count: int
-    favourite_count: int
-    cover_url: str
-    diffs: list = field(default_factory=list)
-    minimal: bool = False   # built from a pack page (id + name only)
-    tags: str = ""
-
-    @property
-    def sr_range(self) -> tuple:
-        if not self.diffs:
-            return (0.0, 0.0)
-        srs = [d.sr for d in self.diffs]
-        return (min(srs), max(srs))
-
-    @property
-    def length(self) -> int:
-        return max((d.length for d in self.diffs), default=0)
-
-    @property
-    def modes(self) -> list:
-        seen, out = set(), []
-        for d in self.diffs:
-            if d.mode not in seen:
-                seen.add(d.mode)
-                out.append(d.mode)
-        return out
-
-    @classmethod
-    def from_json(cls, js: dict) -> "Beatmapset":
-        sid = int(js.get("id", 0) or 0)
-        covers = js.get("covers") or {}
-        cover = (covers.get("card@2x") or covers.get("card")
-                 or covers.get("cover") or covers.get("slimcover") or "")
-        # Nerinyan often omits the covers object; osu!'s CDN serves cover art at a
-        # predictable path keyed by set id, so build it ourselves as a fallback.
-        if not cover and sid:
-            variant = "card" + "@2x.jpg"   # = card@2x.jpg (split to avoid mangling)
-            cover = f"https://assets.ppy.sh/beatmaps/{sid}/covers/{variant}"
-        diffs = []
-        for b in js.get("beatmaps", []) or []:
-            diffs.append(Diff(
-                mode=b.get("mode", "osu"),
-                sr=float(b.get("difficulty_rating", 0) or 0),
-                bpm=float(b.get("bpm", 0) or 0),
-                length=int(b.get("total_length", 0) or 0),
-                version=b.get("version", ""),
-            ))
-        diffs.sort(key=lambda d: d.sr)
-        return cls(
-            id=sid,
-            title=js.get("title", "(unknown)"),
-            artist=js.get("artist", ""),
-            creator=js.get("creator", ""),
-            status=str(js.get("status", "")).lower(),
-            bpm=float(js.get("bpm", 0) or 0),
-            play_count=int(js.get("play_count", 0) or 0),
-            favourite_count=int(js.get("favourite_count", 0) or 0),
-            cover_url=cover,
-            diffs=diffs,
-            tags=str(js.get("tags", "") or ""),
-        )
-
-    @classmethod
-    def from_hinai(cls, js: dict) -> "Beatmapset":
-        """Parse the hinamizawa mirror's CheeseGull-style set object. It carries
-        no BPM or play/favourite counts, so those stay 0 (cards adapt)."""
-        sid = int(js.get("SetID", 0) or 0)
-        diffs = []
-        for b in js.get("ChildrenBeatmaps", []) or []:
-            diffs.append(Diff(
-                mode=HINA_MODE.get(int(b.get("Mode", 0) or 0), "osu"),
-                sr=float(b.get("DifficultyRating", 0) or 0),
-                bpm=0.0,
-                length=int(b.get("TotalLength", 0) or 0),
-                version=b.get("DiffName", ""),
-            ))
-        diffs.sort(key=lambda d: d.sr)
-        variant = "card" + "@2x.jpg"
-        return cls(
-            id=sid,
-            title=js.get("Title", "(unknown)"),
-            artist=js.get("Artist", ""),
-            creator=js.get("Creator", ""),
-            status=HINA_STATUS_REV.get(int(js.get("RankedStatus", 0) or 0), ""),
-            bpm=0.0, play_count=0, favourite_count=0,
-            cover_url=f"https://assets.ppy.sh/beatmaps/{sid}/covers/{variant}",
-            diffs=diffs, tags="",
-        )
-
-    @classmethod
-    def from_pack(cls, sid: int, name: str) -> "Beatmapset":
-        """Lightweight set built from a pack page (only id + 'Artist - Title')."""
-        artist, _, title = name.partition(" - ")
-        if not title:
-            artist, title = "", name
-        variant = "card" + "@2x.jpg"
-        return cls(
-            id=sid, title=title.strip(), artist=artist.strip(), creator="",
-            status="pack", bpm=0, play_count=0, favourite_count=0,
-            cover_url=f"https://assets.ppy.sh/beatmaps/{sid}/covers/{variant}",
-            diffs=[], minimal=True,
-        )
-
-
-# ----------------------------------------------------------------------------
-# API CLIENT
-# ----------------------------------------------------------------------------
-def _field_rank(value: str, query: str) -> int:
-    """Match quality of `query` against a field `value`, lower = closer:
-      0  exact            (artist == "xi")
-      1  field starts with the whole query   ("xi feat. ...")
-      2  query tokens are whole words in the field
-      3  loose: each token only prefixes some word ("xi" -> "xiao")
-     -1  no match
-    Used to order field-scoped results so the exact artist leads and incidental
-    matches (a word merely starting with the query) sink to the end."""
-    v = (value or "").lower().strip()
-    q = query.lower().strip()
-    if not q or v == q:
-        return 0
-    if v.startswith(q):
-        return 1
-    vwords = re.findall(r"[0-9a-z]+", v)
-    qtoks = re.findall(r"[0-9a-z]+", q)
-    if not qtoks:
-        return 0
-    if all(t in vwords for t in qtoks):
-        return 2
-    if all(any(w.startswith(t) for w in vwords) for t in qtoks):
-        return 3
-    return -1
-
-
-def _field_match(value: str, query: str) -> bool:
-    """True if `query` matches `value` at all (any quality tier)."""
-    return _field_rank(value, query) >= 0
-
-
-_FIELD_GETTERS = {
-    "title": lambda s: s.title,
-    "artist": lambda s: s.artist,
-    "creator": lambda s: s.creator,
-    "tag": lambda s: s.tags,
-}
-
-
-def passes_range(s: "Beatmapset", f: dict) -> bool:
-    """Client-side BPM / star-rating / length range filter (Nerinyan's GET API
-    has no query param for these). A set matches if ANY of its difficulties falls
-    in range -- same semantics as the site's server-side filter."""
-    if f["bpm_min"] or f["bpm_max"]:
-        bpms = [d.bpm for d in s.diffs if d.bpm] or ([s.bpm] if s.bpm else [])
-        if bpms:
-            if f["bpm_min"] and max(bpms) < f["bpm_min"]:
-                return False
-            if f["bpm_max"] and min(bpms) > f["bpm_max"]:
-                return False
-    if f["sr_min"] or f["sr_max"]:
-        diffs = s.diffs
-        if f["mode"] is not None:
-            mode_str = {0: "osu", 1: "taiko", 2: "fruits", 3: "mania"}[f["mode"]]
-            diffs = [d for d in diffs if d.mode == mode_str] or s.diffs
-        srs = [d.sr for d in diffs] or [0.0]
-        if f["sr_min"] and max(srs) < f["sr_min"]:
-            return False
-        if f["sr_max"] and min(srs) > f["sr_max"]:
-            return False
-    if f.get("len_min") or f.get("len_max"):
-        lengths = [d.length for d in s.diffs if d.length]
-        if lengths:                      # keep sets with no length data
-            if f.get("len_min") and max(lengths) < f["len_min"]:
-                return False
-            if f.get("len_max") and min(lengths) > f["len_max"]:
-                return False
-    return True
-
-
-def _has_client_filter(f: dict) -> bool:
-    """Whether this search is narrowed in the client (BPM / star / length range,
-    or a 'Search in' field scope) and therefore benefits from the larger page."""
-    return bool(f.get("bpm_min") or f.get("bpm_max") or f.get("sr_min")
-                or f.get("sr_max") or f.get("len_min") or f.get("len_max")
-                or (f.get("option") and (f.get("q") or "").strip()))
-
-
-def _fetch_search_page(base: dict, page: int, ps: int) -> list:
-    params = dict(base, p=page, ps=ps)
-    r = requests.get(NERINYAN_SEARCH, params=params,
-                     headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    return data if isinstance(data, list) else data.get("beatmapsets", [])
-
-
-def fetch_card_meta(set_id: int) -> tuple:
-    """Fetch full osu!-web metadata for one set from osu.direct (BPM, play and
-    favourite counts, accurate per-diff data) to enrich a hinamizawa card.
-    Returns (set_id, Beatmapset)."""
-    r = requests.get(OSU_DIRECT_SET.format(id=set_id),
-                     headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, list):
-        data = data[0] if data else None
-    if not isinstance(data, dict) or not data.get("id"):
-        raise RuntimeError(f"no metadata for set {set_id}")
-    return set_id, Beatmapset.from_json(data)
-
-
-def search_beatmapsets(filters: dict, token) -> tuple:
-    """Search via the hinamizawa mirror (complete index, clean relevance, genre/
-    language/sort/status filters), falling back to Nerinyan only if it errors so
-    the app keeps working."""
-    try:
-        return _search_hinamizawa(filters, token)
-    except Exception:
-        if token is None:                  # fall back only on a fresh search; a
-            return _search_nerinyan(filters, None)   # paging token isn't portable
-        return [], None
-
-
-def _hina_get(params: dict, status_code=None) -> list:
-    """Fetch one page and parse to Beatmapsets. If a status_code is given, it's
-    sent as the `status` filter AND used to tag each result (the response's
-    RankedStatus field is unreliable, so the queried code is authoritative)."""
-    if status_code is not None:
-        params = dict(params, status=status_code)
-    r = requests.get(HINA_SEARCH, params=params,
-                     headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    raw = data if isinstance(data, list) else []
-    sets = [Beatmapset.from_hinai(s) for s in raw]
-    if status_code is not None:
-        label = HINA_CODE_STATUS.get(status_code, "")
-        for s in sets:
-            s.status = label
-    return sets
-
-
-def _client_sort(sets: list, sort_key: str) -> list:
-    """Sort a merged/field-scoped result set locally. Title/artist sort on those
-    fields; ranked/updated use the set id as an age proxy (lower id = older), since
-    the search response has no date/play fields. Other sorts keep their order."""
-    if sort_key == "title_asc":
-        return sorted(sets, key=lambda s: s.title.lower())
-    if sort_key == "title_desc":
-        return sorted(sets, key=lambda s: s.title.lower(), reverse=True)
-    if sort_key == "artist_asc":
-        return sorted(sets, key=lambda s: s.artist.lower())
-    if sort_key == "ranked_asc":
-        return sorted(sets, key=lambda s: s.id)
-    if sort_key in ("ranked_desc", "updated_desc"):
-        return sorted(sets, key=lambda s: s.id, reverse=True)
-    return sets
-
-
-def _search_hinamizawa(filters: dict, token) -> tuple:
-    """Query the hinamizawa mirror and return (list[Beatmapset], next_token|None).
-
-    The mirror has no "all statuses" option and returns nothing for a text search
-    with no status, so "Any" fans out across every status code and merges. Each
-    result is tagged with the status we *queried* (its RankedStatus field only
-    reports 0/1). Field-scoped searches (Artist/Title/Mapper) are fetched by
-    relevance so the whole catalogue surfaces, then sorted locally for display;
-    browses page server-side via `offset`. BPM/play counts aren't in the response
-    (cards enrich those from osu.direct), so BPM ranges filter server-side and
-    stars/length filter locally.
-    """
-    offset = 0 if token is None else int(token)
-    q = filters["q"].strip()
-    base = {"query": q, "amount": HINA_AMOUNT}
-    if filters.get("mode") is not None:
-        base["mode"] = filters["mode"]
-    if filters.get("genre"):
-        base["genre"] = filters["genre"]
-    if filters.get("language"):
-        base["language"] = filters["language"]
-    if filters.get("bpm_min"):                       # bpm not in the response, so
-        base["min_bpm"] = filters["bpm_min"]         # ranges filter server-side
-    if filters.get("bpm_max"):
-        base["max_bpm"] = filters["bpm_max"]
-
-    codes = HINA_STATUS.get(filters.get("status")) or [1]   # default to ranked-tier
-    getter = _FIELD_GETTERS.get(filters.get("option") or "")
-    field_scope = bool(q and getter and filters.get("option") != "tag")
-    multi = len(codes) > 1                                  # only "Any" now
-
-    if field_scope or multi:
-        # One batch per status code, merged into a single (unpaginated) result.
-        # Field scope fetches by relevance so the artist's catalogue clusters in;
-        # otherwise we server-sort each code. Either way we re-sort the *merged*
-        # list locally so statuses interleave instead of appending in blocks
-        # (which made "oldest" show old maps then a wall of fresh qualified ones).
-        sort = HINA_SORT.get(filters.get("sort"))
-        if sort and not field_scope:
-            base["sort"] = sort
-        sets, have = [], set()
-        for c in codes:
-            for s in _hina_get(dict(base), c):
-                if s.id not in have:
-                    have.add(s.id)
-                    sets.append(s)
-        if field_scope:
-            ranked = [(rk, s) for s in sets
-                      for rk in (_field_rank(getter(s), q),) if rk >= 0]
-            ranked.sort(key=lambda t: t[0])
-            sets = [s for _, s in ranked]
-        sets = _client_sort(sets, filters.get("sort"))
-        next_token = None
-    else:
-        # Single status: page server-side via offset, server-sorted.
-        sort = HINA_SORT.get(filters.get("sort"))
-        if sort:
-            base["sort"] = sort
-        raw = _hina_get(dict(base, offset=offset), codes[0])
-        sets = list(raw)
-        next_token = offset + HINA_AMOUNT if len(raw) >= HINA_AMOUNT else None
-
-    # stars + length client-side (bpm is filtered server-side; bpm fields are 0)
-    if any(filters.get(k) for k in ("sr_min", "sr_max", "len_min", "len_max")):
-        sets = [s for s in sets if passes_range(s, filters)]
-    return sets, next_token
-
-
-def _search_nerinyan(filters: dict, token) -> tuple:
-    """Fallback backend (Nerinyan, GET) -> (list[Beatmapset], next_token|None).
-
-    Used only when the hinamizawa mirror is unreachable. The deployed mirror
-    ignores the per-field `option` param (it silently disables text filtering),
-    so a "Search in" field scope is done client-side. An artist's maps are
-    scattered through a noisy `q` result by title, so for a field-scoped search we
-    pull the *whole* (bounded) `q` result set in max-size pages and filter + rank
-    locally. BPM/star/length ranges have no query param either and are applied here.
-    """
-    base = {
-        "q": filters["q"].strip(),
-        "s": "all" if filters["status"] in (None, "", "any") else filters["status"],
-        "sort": filters["sort"],
-    }
-    if filters["mode"] is not None:
-        base["m"] = filters["mode"]
-
-    q = filters["q"].strip()
-    getter = _FIELD_GETTERS.get(filters.get("option") or "")
-    range_filter = any(filters.get(k) for k in ("bpm_min", "bpm_max", "sr_min",
-                                                "sr_max", "len_min", "len_max"))
-
-    if q and getter:
-        # Pull the full result set for this query (capped), tolerating the server
-        # clamping `ps` to its own max -- we detect the real page size and stop at
-        # the last (short) page rather than assuming a fixed size.
-        raw, page_size = [], None
-        for p in range(FIELD_SEARCH_MAX_PAGES):
-            page = _fetch_search_page(base, p, FIELD_SEARCH_PS)
-            if not page:
-                break
-            raw.extend(page)
-            if page_size is None:
-                page_size = len(page)
-            if len(page) < page_size:      # last, partial page
-                break
-        sets = [Beatmapset.from_json(s) for s in raw]
-        ranked = [(r, s) for s in sets for r in (_field_rank(getter(s), q),) if r >= 0]
-        ranked.sort(key=lambda t: t[0])    # stable: keeps the chosen sort within a tier
-        sets = [s for _, s in ranked]
-        if range_filter:
-            sets = [s for s in sets if passes_range(s, filters)]
-        return sets, None                  # complete set; no further paging
-
-    # Non-field search: one page at a time (range filters use a bigger page so a
-    # rare match isn't stranded), with normal scroll pagination.
-    page = 0 if token is None else int(token)
-    ps = FILTER_PAGE_SIZE if range_filter else PAGE_SIZE
-    raw = _fetch_search_page(base, page, ps)
-    sets = [Beatmapset.from_json(s) for s in raw]
-    if range_filter:
-        sets = [s for s in sets if passes_range(s, filters)]
-    next_token = page + 1 if len(raw) >= ps else None
-    return sets, next_token
-
-
-# ----------------------------------------------------------------------------
-# osu! LIBRARY DETECTION
-# ----------------------------------------------------------------------------
-def candidate_songs_dirs() -> list:
-    home = Path.home()
-    cands = [
-        home / ".local/share/osu-wine/osu!/Songs",
-        home / ".local/share/osu-wine/OSU/Songs",
-        home / ".local/share/osu/Songs",
-        home / "Games/osu/drive_c/users" ,  # lutris-ish, scanned shallowly below
-        Path(os.environ.get("LOCALAPPDATA", "")) / "osu!/Songs",
-        home / "AppData/Local/osu!/Songs",
-        home / "Library/Application Support/osu/Songs",
-    ]
-    found = []
-    for c in cands:
-        try:
-            if c.is_dir():
-                found.append(c)
-        except OSError:
-            pass
-    return found
-
-
-def scan_downloaded_ids(songs_dir: str) -> set:
-    """Beatmap folders / .osz files are named '<setid> Artist - Title'."""
-    ids = set()
-    if not songs_dir:
-        return ids
-    p = Path(songs_dir)
-    if not p.is_dir():
-        return ids
-    try:
-        for entry in p.iterdir():
-            m = re.match(r"^(\d+)\b", entry.name)
-            if m:
-                ids.add(int(m.group(1)))
-    except OSError:
-        pass
-    return ids
-
-
-def load_history(path: Path) -> set:
-    """Load the persistent set of set-ids downloaded through this app."""
-    try:
-        return {int(x) for x in json.loads(Path(path).read_text())}
-    except Exception:  # noqa: BLE001 - missing/corrupt file is fine
-        return set()
-
-
-def save_history(path: Path, ids: set):
-    try:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps(sorted(ids)))
-    except OSError:
-        pass
-
-
-# ----------------------------------------------------------------------------
-# MEDAL PACKS  +  osu!stable collection.db
-# ----------------------------------------------------------------------------
-# collection.db layout (osu!stable):
-#   int32 version
-#   int32 collection_count
-#   per collection:  osu-string name,  int32 map_count,  map_count x osu-string md5
-# osu-string: 0x00 (null) OR 0x0b + ULEB128 length + UTF-8 bytes.
-DEFAULT_DB_VERSION = 20231101
-
-
-def _read_uleb128(buf: bytes, pos: int):
-    val = shift = 0
-    while True:
-        b = buf[pos]; pos += 1
-        val |= (b & 0x7f) << shift
-        if not (b & 0x80):
-            return val, pos
-        shift += 7
-
-
-def _write_uleb128(n: int) -> bytes:
-    out = bytearray()
-    while True:
-        b = n & 0x7f
-        n >>= 7
-        out.append(b | (0x80 if n else 0))
-        if not n:
-            return bytes(out)
-
-
-def _read_osu_string(buf: bytes, pos: int):
-    kind = buf[pos]; pos += 1
-    if kind == 0x00:
-        return "", pos
-    if kind != 0x0b:
-        raise ValueError(f"bad osu string marker {kind:#x} at {pos - 1}")
-    length, pos = _read_uleb128(buf, pos)
-    s = buf[pos:pos + length].decode("utf-8", "replace")
-    return s, pos + length
-
-
-def _write_osu_string(s: str) -> bytes:
-    if s is None:
-        return b"\x00"
-    data = s.encode("utf-8")
-    return b"\x0b" + _write_uleb128(len(data)) + data
-
-
-def read_collection_db(path: Path):
-    """Return (version, [(name, [md5, ...]), ...]). ([] if file missing/unreadable)."""
-    try:
-        buf = Path(path).read_bytes()
-    except OSError:
-        return DEFAULT_DB_VERSION, []
-    pos = 0
-    version = int.from_bytes(buf[pos:pos + 4], "little"); pos += 4
-    count = int.from_bytes(buf[pos:pos + 4], "little"); pos += 4
-    collections = []
-    for _ in range(count):
-        name, pos = _read_osu_string(buf, pos)
-        n = int.from_bytes(buf[pos:pos + 4], "little"); pos += 4
-        hashes = []
-        for _ in range(n):
-            h, pos = _read_osu_string(buf, pos)
-            hashes.append(h)
-        collections.append((name, hashes))
-    return version, collections
-
-
-def write_collection_db(path: Path, version: int, collections):
-    out = bytearray()
-    out += int(version).to_bytes(4, "little")
-    out += len(collections).to_bytes(4, "little")
-    for name, hashes in collections:
-        out += _write_osu_string(name)
-        out += len(hashes).to_bytes(4, "little")
-        for h in hashes:
-            out += _write_osu_string(h)
-    Path(path).write_bytes(bytes(out))
-
-
-def md5s_from_osz(osz_path) -> list:
-    """MD5 (hex) of every .osu difficulty inside an .osz - matches osu!'s map hashes."""
-    import zipfile
-    hashes = []
-    try:
-        with zipfile.ZipFile(osz_path) as z:
-            for name in z.namelist():
-                if name.lower().endswith(".osu"):
-                    hashes.append(hashlib.md5(z.read(name)).hexdigest())
-    except (zipfile.BadZipFile, OSError):
-        pass
-    return hashes
-
-
-def upsert_collection(db_path: Path, name: str, hashes: list) -> str:
-    """Create/replace a named collection in collection.db (backing up first).
-
-    Returns a short status string. Designed to run with osu! closed.
-    """
-    db_path = Path(db_path)
-    version, collections = read_collection_db(db_path)
-    if db_path.exists():
-        backup = db_path.with_suffix(db_path.suffix + ".bak")
-        try:
-            backup.write_bytes(db_path.read_bytes())
-        except OSError:
-            pass
-    # de-dupe while preserving order
-    seen, uniq = set(), []
-    for h in hashes:
-        if h and h not in seen:
-            seen.add(h); uniq.append(h)
-    collections = [(n, h) for (n, h) in collections if n != name]
-    collections.append((name, uniq))
-    write_collection_db(db_path, version or DEFAULT_DB_VERSION, collections)
-    return f"{len(uniq)} maps in collection \u201c{name}\u201d"
-
-
-def default_collection_db_path(songs_dir: str) -> Path:
-    """collection.db lives in the osu! root, i.e. the parent of the Songs folder."""
-    p = Path(songs_dir) if songs_dir else Path.home()
-    return p.parent / "collection.db"
-
-
-_MEDAL_ROW_RE = re.compile(r"^\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*$")
-_PACK_TAG_RE = re.compile(r"/beatmaps/packs/([A-Za-z0-9]+)")
-
-
-def parse_pack_medals(markdown: str) -> list:
-    """Parse the wiki table into [{'medal': str, 'tags': [str, ...]}]."""
-    medals = []
-    for line in markdown.splitlines():
-        m = _MEDAL_ROW_RE.match(line)
-        if not m:
-            continue
-        medal, req = m.group(1), m.group(2)
-        if medal.lower().startswith("medal name") or set(medal) <= {"-", ":", " "}:
-            continue
-        tags = _PACK_TAG_RE.findall(req)
-        if tags:
-            medals.append({"medal": medal.replace("\\", ""), "tags": tags})
-    return medals
-
-
-# Each pack entry looks like:
-#   <a href="...beatmapsets/123" class="beatmap-pack-items__link">
-#     <span class="beatmap-pack-items__artist">Artist</span>
-#     <span class="beatmap-pack-items__title"> - Title</span></a>
-_PACK_SET_RE = re.compile(
-    r'/beatmapsets/(\d+)"[^>]*class="beatmap-pack-items__link"[^>]*>'
-    r'\s*<span class="beatmap-pack-items__artist">([^<]*)</span>'
-    r'\s*<span class="beatmap-pack-items__title">([^<]*)</span>', re.S)
-_PACK_ID_RE = re.compile(r'/beatmapsets/(\d+)')
-
-
-def parse_pack_page(html_text: str) -> list:
-    """Parse a pack page into [(set_id, 'Artist - Title'), ...] (deduped, ordered).
-    The title span already carries the ' - ' separator, so artist+title rebuilds
-    the familiar 'Artist - Title' string. Falls back to ids-only if the markup
-    ever changes (covers still load; names just stay blank)."""
-    import html as _html
-    out, seen = [], set()
-    for sid, artist, title in _PACK_SET_RE.findall(html_text):
-        sid = int(sid)
-        if sid in seen:
-            continue
-        seen.add(sid)
-        out.append((sid, _html.unescape((artist + title).strip())))
-    if out:
-        return out
-    for raw in _PACK_ID_RE.findall(html_text):     # fallback: ids only
-        sid = int(raw)
-        if sid not in seen:
-            seen.add(sid)
-            out.append((sid, ""))
-    return out
-
-
-_PACK_LIST_RE = re.compile(
-    r'data-pack-tag="([^"]+)"\s*>\s*<a[^>]*class="beatmap-pack__header[^"]*"[^>]*>\s*'
-    r'<div class="beatmap-pack__name">([^<]*)</div>\s*'
-    r'<div class="beatmap-pack__details">\s*'
-    r'<span class="beatmap-pack__date">([^<]*)</span>', re.S)
-_PACK_LIST_FALLBACK_RE = re.compile(
-    r'data-pack-tag="([^"]+)".*?beatmap-pack__name">([^<]*)<', re.S)
-
-
-def _pack_mode(name: str) -> str:
-    """Best-effort game mode from a pack name (the Standard category mixes modes,
-    e.g. 'osu!taiko Beatmap Pack #410'). '' when the name gives no hint."""
-    n = name.lower()
-    if "osu!taiko" in n:
-        return "taiko"
-    if "osu!catch" in n or "osu!fruits" in n:
-        return "fruits"
-    if "osu!mania" in n:
-        return "mania"
-    if "osu!" in n:
-        return "osu"
-    return ""
-
-
-def parse_pack_list(html_text: str) -> list:
-    """Parse a pack listing page into [{'tag','name','date','mode'}, ...]."""
-    import html as _html
-    out = []
-    for tag, name, date in _PACK_LIST_RE.findall(html_text):
-        nm = _html.unescape(name.strip())
-        out.append({"tag": tag, "name": nm, "date": date.strip(), "mode": _pack_mode(nm)})
-    if not out:                                   # markup changed: tag + name only
-        for tag, name in _PACK_LIST_FALLBACK_RE.findall(html_text):
-            nm = _html.unescape(name.strip())
-            out.append({"tag": tag, "name": nm, "date": "", "mode": _pack_mode(nm)})
-    return out
-
-
-def fetch_pack_list(pack_type: str, page: int) -> list:
-    """Fetch one listing page (100 packs, newest first). Empty list = past the end."""
-    url = PACK_LIST_URL.format(type=pack_type, page=page)
-    r = requests.get(url, headers={"User-Agent": DOWNLOAD_UA}, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    return parse_pack_list(r.text)
-
-
-def fetch_most_played(username: str, limit: int) -> tuple:
-    """Resolve a username/ID and return (username, [Beatmapset, ...]) for their
-    most-played maps, deduped to beatmapsets and ordered by total play count.
-    Uses the public profile JSON route -- no login or API key."""
-    prof = requests.get(USER_PROFILE_URL.format(user=username),
-                        headers={"User-Agent": DOWNLOAD_UA}, timeout=HTTP_TIMEOUT)
-    prof.raise_for_status()
-    m = re.search(r"/users/(\d+)", prof.url)
-    if not m:
-        raise RuntimeError(f"couldn't find user '{username}'")
-    uid = m.group(1)
-    hdr = {"User-Agent": DOWNLOAD_UA, "Accept": "application/json",
-           "X-Requested-With": "XMLHttpRequest"}
-    sets, order, scanned, offset = {}, [], 0, 0
-    while scanned < limit:
-        n = min(MOST_PLAYED_PAGE, limit - scanned)
-        rr = requests.get(MOST_PLAYED_URL.format(id=uid, limit=n, offset=offset),
-                          headers=hdr, timeout=HTTP_TIMEOUT)
-        rr.raise_for_status()
-        batch = rr.json()
-        if not isinstance(batch, list) or not batch:
-            break
-        for item in batch:
-            bs = item.get("beatmapset")
-            if not isinstance(bs, dict) or not bs.get("id"):
-                continue
-            sid = bs["id"]
-            cnt = int(item.get("count", 0) or 0)
-            if sid in sets:                      # same set, another difficulty
-                sets[sid]["count"] += cnt
-            else:
-                sets[sid] = {"set": Beatmapset.from_json(bs), "count": cnt}
-                order.append(sid)
-        scanned += len(batch)
-        offset += len(batch)
-        if len(batch) < n:                       # reached the end of their plays
-            break
-    order.sort(key=lambda sid: -sets[sid]["count"])
-    return username, [sets[sid]["set"] for sid in order]
-
-
-def fetch_pack_medals() -> list:
-    """Download the wiki table and return the medal -> pack-tag list."""
-    r = requests.get(MEDAL_WIKI_URL, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    medals = parse_pack_medals(r.text)
-    if not medals:
-        raise RuntimeError("could not parse the medal list")
-    return medals
-
-
-def fetch_pack_contents(tags: list) -> list:
-    """Return the combined, deduped [(set_id, name)] across one or more pack tags."""
-    out, seen = [], set()
-    for tag in tags:
-        url = PACK_PAGE_URL.format(tag=tag)
-        # browser UA: the pack pages are public but reject obvious bots
-        r = requests.get(url, headers={"User-Agent": DOWNLOAD_UA}, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        for sid, name in parse_pack_page(r.text):
-            if sid not in seen:
-                seen.add(sid)
-                out.append((sid, name))
-    if not out:
-        raise RuntimeError("no beatmaps found for this pack")
-    return out
-
-
-def fetch_set_meta(set_id: int, name: str) -> tuple:
-    """Best-effort full metadata for one pack map. The mirror has no per-set
-    endpoint, so we run the normal text search for the map's name and match the
-    exact set id in the results. Returns (set_id, Beatmapset); raises if the set
-    doesn't surface (the card then keeps its artist/title from the pack page)."""
-    if not name:
-        raise RuntimeError("no name to search")
-    f = {"q": name, "status": "all", "sort": "title_asc", "mode": None,
-         "option": "", "bpm_min": 0, "bpm_max": 0, "sr_min": 0, "sr_max": 0,
-         "hide_owned": False, "no_video": False}
-    sets, _ = search_beatmapsets(f, None)
-    for s in sets:
-        if s.id == set_id:
-            return set_id, s
-    raise RuntimeError(f"set {set_id} not found via search")
+# Core (Qt-free) logic lives in circlewave_core so it can be unit-tested
+# without importing PySide6. Pull its public API into this namespace.
+from circlewave_core import *  # noqa: F401,F403
+from circlewave_core import (  # non-exported internals the GUI needs
+    _has_client_filter, log,
+)
 
 
 # ----------------------------------------------------------------------------
@@ -1080,15 +145,15 @@ class ImageWorker(QRunnable):
             if cache_file.exists():
                 self.signals.done.emit(self.setid, cache_file.read_bytes())
                 return
-            r = requests.get(self.url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+            r = SESSION.get(self.url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
             if r.status_code == 200 and r.content:
                 try:
                     cache_file.write_bytes(r.content)
-                except OSError:
-                    pass
+                except OSError as e:
+                    log.debug("cover cache write failed for %s: %s", self.setid, e)
                 self.signals.done.emit(self.setid, r.content)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 - a missing cover is non-fatal
+            log.debug("cover fetch failed for %s: %s", self.setid, e)
 
 
 class DownloadSignals(QObject):
@@ -1105,10 +170,33 @@ class DownloadWorker(QRunnable):
         self.no_video = no_video
         self.mirrors = mirrors
         self.signals = DownloadSignals()
-        self.cancelled = False
+        # threading.Event, not a bare bool: the flag is set from the GUI thread
+        # and read from the worker thread, and Event makes that hand-off explicit.
+        self._cancel = threading.Event()
 
     def cancel(self):
-        self.cancelled = True
+        self._cancel.set()
+
+    @property
+    def cancelled(self) -> bool:      # kept for callers that inspect the flag
+        return self._cancel.is_set()
+
+    @staticmethod
+    def _looks_like_zip(path: Path) -> bool:
+        """A complete .osz is a zip; is_zipfile validates the central directory,
+        so it also rejects truncated (interrupted) downloads and HTML error pages."""
+        try:
+            return zipfile.is_zipfile(path)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _discard(*paths: Path):
+        for p in paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @Slot()
     def run(self):
@@ -1119,50 +207,96 @@ class DownloadWorker(QRunnable):
         dest = dest_dir / fname
         # Stage the partial file *inside* the destination dir so the final move
         # is a same-filesystem atomic rename (avoids cross-device errors when the
-        # system temp dir is a tmpfs and the download folder is on disk).
+        # system temp dir is a tmpfs and the download folder is on disk). A sidecar
+        # .part.url records which mirror URL produced the partial, so a resume only
+        # ever extends a partial from the *same* URL (mirrors aren't interchangeable).
         tmp = dest_dir / (fname + ".part")
+        meta = dest_dir / (fname + ".part.url")
         last_err = "no mirror succeeded"
 
         for mirror in self.mirrors:
-            if self.cancelled:
+            if self._cancel.is_set():
                 self.signals.failed.emit(sid, "cancelled")
                 return
             url = mirror["novideo"] if (self.no_video and mirror["novideo"]) else mirror["full"]
             url = url.format(id=sid)
-            self.signals.progress.emit(sid, -1, f"trying {mirror['name']}\u2026")
+
+            # Resume only if we have a partial tagged with this exact URL.
+            resume_from = 0
+            if tmp.exists() and meta.exists() and _read_text(meta) == url:
+                resume_from = tmp.stat().st_size
+            else:
+                self._discard(tmp, meta)   # stale / foreign partial
+
+            headers = {"User-Agent": DOWNLOAD_UA}
+            if resume_from:
+                headers["Range"] = f"bytes={resume_from}-"
+            note = "resuming" if resume_from else "trying"
+            self.signals.progress.emit(sid, -1, f"{note} {mirror['name']}\u2026")
+
             try:
-                with requests.get(url, headers={"User-Agent": DOWNLOAD_UA},
-                                  stream=True, timeout=HTTP_TIMEOUT, allow_redirects=True) as r:
+                with SESSION.get(url, headers=headers, stream=True,
+                                 timeout=HTTP_TIMEOUT, allow_redirects=True) as r:
                     ctype = r.headers.get("Content-Type", "").lower()
-                    if r.status_code != 200 or "text/html" in ctype or "json" in ctype:
+                    if r.status_code not in (200, 206) or "text/html" in ctype or "json" in ctype:
                         last_err = f"{mirror['name']} HTTP {r.status_code}"
+                        self._discard(tmp, meta)      # response body is not an .osz
                         continue
-                    total = int(r.headers.get("Content-Length", 0) or 0)
-                    got = 0
-                    with open(tmp, "wb") as fh:
+
+                    if r.status_code == 206 and resume_from:
+                        mode, got = "ab", resume_from            # server honoured Range
+                        total = resume_from + int(r.headers.get("Content-Length", 0) or 0)
+                    else:                                        # full body (Range ignored / fresh)
+                        mode, got, resume_from = "wb", 0, 0
+                        total = int(r.headers.get("Content-Length", 0) or 0)
+
+                    meta.write_text(url)
+                    start_t, start_got, last_emit = time.monotonic(), got, 0.0
+                    with open(tmp, mode) as fh:
                         for chunk in r.iter_content(chunk_size=65536):
-                            if self.cancelled:
-                                fh.close()
-                                tmp.unlink(missing_ok=True)
+                            if self._cancel.is_set():
+                                fh.flush()
+                                # Keep tmp + meta so this mirror can resume later.
                                 self.signals.failed.emit(sid, "cancelled")
                                 return
                             if chunk:
                                 fh.write(chunk)
                                 got += len(chunk)
-                                pct = int(got * 100 / total) if total else -1
-                                self.signals.progress.emit(sid, pct, mirror["name"])
-                    if got < 1024:  # almost certainly an error page
-                        last_err = f"{mirror['name']} returned {got} bytes"
-                        tmp.unlink(missing_ok=True)
+                                now = time.monotonic()
+                                if now - last_emit >= 0.25:   # throttle UI updates
+                                    last_emit = now
+                                    pct = int(got * 100 / total) if total else -1
+                                    elapsed = now - start_t
+                                    speed = (got - start_got) / elapsed if elapsed > 0.5 else 0
+                                    status = mirror["name"]
+                                    if speed:
+                                        status += f"  ·  {fmt_speed(speed)}"
+                                        if total:
+                                            status += f"  ·  {fmt_eta((total - got) / speed)}"
+                                    self.signals.progress.emit(sid, pct, status)
+
+                    if got < 1024 or not self._looks_like_zip(tmp):
+                        last_err = f"{mirror['name']} returned an invalid/partial file"
+                        self._discard(tmp, meta)
                         continue
                     tmp.replace(dest)
+                    self._discard(meta)
                     self.signals.done.emit(sid, str(dest))
                     return
             except Exception as e:  # noqa: BLE001
+                # Network hiccup: keep the partial so the same mirror can resume.
+                log.warning("download %s via %s failed: %s", sid, mirror["name"], e)
                 last_err = f"{mirror['name']}: {e}"
                 continue
 
         self.signals.failed.emit(sid, last_err)
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text()
+    except OSError:
+        return ""
 
 
 def sanitize_filename(name: str) -> str:
@@ -1275,6 +409,7 @@ class BeatmapCard(QFrame):
 
     previewRequested = Signal(int)
     downloadRequested = Signal(object)
+    detailsRequested = Signal(object)
 
     def __init__(self, s: Beatmapset, downloaded: bool):
         super().__init__()
@@ -1363,6 +498,13 @@ class BeatmapCard(QFrame):
         self.dl_btn.setObjectName("dlbtn")
         self.dl_btn.clicked.connect(lambda: self.downloadRequested.emit(self.s))
         btns.addWidget(self.dl_btn, 1)
+
+        self.info_btn = QToolButton()
+        self.info_btn.setText("\u24d8")            # circled i
+        self.info_btn.setToolTip("Details \u2014 all difficulties, more by this mapper/artist")
+        self.info_btn.setObjectName("circbtn")
+        self.info_btn.clicked.connect(lambda: self.detailsRequested.emit(self.s))
+        btns.addWidget(self.info_btn)
 
         web_btn = QToolButton()
         web_btn.setText("\u2197")
@@ -1504,11 +646,12 @@ def elide(text: str, width: int, bold: bool = False, px: int = 0) -> str:
     return fm.elidedText(text, Qt.ElideRight, width)
 
 
-def apply_glow(widget, hexcolor="#ff66ab", radius=22, alpha=150):
-    """Soft neon glow around a widget (Qt has no CSS box-shadow)."""
+def apply_glow(widget, hexcolor=None, radius=22, alpha=150):
+    """Soft neon glow around a widget (Qt has no CSS box-shadow). Defaults to the
+    active theme's accent."""
     eff = QGraphicsDropShadowEffect(widget)
     eff.setBlurRadius(radius)
-    col = QColor(hexcolor)
+    col = QColor(hexcolor or ACCENT_HEX)
     col.setAlpha(alpha)
     eff.setColor(col)
     eff.setOffset(0, 0)
@@ -1523,6 +666,7 @@ class FilterBar(QWidget):
     medalPacksRequested = Signal()
     beatmapPacksRequested = Signal()
     mostPlayedRequested = Signal()
+    randomRequested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -1536,12 +680,12 @@ class FilterBar(QWidget):
         logo = QLabel("\u25ce")          # hitcircle motif
         logo.setObjectName("logo")
         row1.addWidget(logo)
-        # Two-tone wordmark: last ~4 letters get the cyan accent. Falls back to a
-        # single colour for very short names. Driven entirely by APP_TITLE.
+        # Two-tone wordmark: last ~4 letters get the secondary accent. Falls back to
+        # a single colour for very short names. Driven entirely by APP_TITLE.
         _t = APP_TITLE
         if len(_t) > 4:
             _head, _tail = _t[:-4], _t[-4:]
-            _markup = f"{_head}<span style='color:#36e0ff'>{_tail}</span>"
+            _markup = f"{_head}<span style='color:{ACCENT2_HEX}'>{_tail}</span>"
         else:
             _markup = _t
         wordmark = QLabel(_markup)
@@ -1555,13 +699,13 @@ class FilterBar(QWidget):
         self.query.setObjectName("search")
         self.query.setPlaceholderText("Search title, artist, mapper, tags\u2026   (leave empty for the A\u2013Z catalog)")
         self.query.returnPressed.connect(self.searchRequested.emit)
-        apply_glow(self.query, "#ff66ab", radius=16, alpha=70)
+        apply_glow(self.query, radius=16, alpha=70)
         row1.addWidget(self.query, 1)
 
         self.search_btn = QPushButton("Search")
         self.search_btn.setObjectName("primary")
         self.search_btn.clicked.connect(self.searchRequested.emit)
-        apply_glow(self.search_btn, "#ff66ab", radius=20, alpha=130)
+        apply_glow(self.search_btn, radius=20, alpha=130)
         row1.addWidget(self.search_btn)
 
         self.medals_btn = QPushButton("\U0001F3C5  Medal packs")
@@ -1581,6 +725,21 @@ class FilterBar(QWidget):
         self.mostplayed_btn.setToolTip("Load a player's most-played beatmaps and grab them all")
         self.mostplayed_btn.clicked.connect(self.mostPlayedRequested.emit)
         row1.addWidget(self.mostplayed_btn)
+
+        self.random_btn = QToolButton()
+        self.random_btn.setText("\U0001F3B2")          # 🎲
+        self.random_btn.setObjectName("medalbtn")
+        self.random_btn.setToolTip("Surprise me — open a random map from the results")
+        self.random_btn.clicked.connect(self.randomRequested.emit)
+        row1.addWidget(self.random_btn)
+
+        # Presets: a popup menu, populated by MainWindow, to save/apply filter sets.
+        self.presets_btn = QToolButton()
+        self.presets_btn.setText("★")             # ★
+        self.presets_btn.setObjectName("medalbtn")
+        self.presets_btn.setToolTip("Saved filter presets")
+        self.presets_btn.setPopupMode(QToolButton.InstantPopup)
+        row1.addWidget(self.presets_btn)
         outer.addLayout(row1)
 
         # filters live in a distinct surface panel so they read as real controls
@@ -1696,6 +855,44 @@ class FilterBar(QWidget):
             "hide_owned": self.hide_owned.isChecked(),
             "no_video": self.no_video.isChecked(),
         }
+
+    def set_filters(self, f: dict):
+        """Apply a saved preset to the controls (reverse of filters()). Signals are
+        blocked so the caller triggers exactly one search afterwards."""
+        widgets = [self.query, self.mode, self.status, self.sort, self.bpm,
+                   self.length, self.stars, self.genre, self.language,
+                   self.search_in, self.hide_owned, self.no_video]
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            self.query.setText(f.get("q", "") or "")
+            self._pick(self.mode, f.get("mode"))
+            self._pick(self.status, f.get("status", "all"))
+            self._pick(self.sort, f.get("sort", "ranked_desc"))
+            self._pick(self.search_in, f.get("option", ""))
+            self._pick(self.genre, f.get("genre", 0))
+            self._pick(self.language, f.get("language", 0))
+            self._pick_range(self.bpm, f.get("bpm_min", 0), f.get("bpm_max", 0))
+            self._pick_range(self.stars, f.get("sr_min", 0), f.get("sr_max", 0))
+            self._pick_range(self.length, f.get("len_min", 0), f.get("len_max", 0))
+            self.hide_owned.setChecked(bool(f.get("hide_owned")))
+            self.no_video.setChecked(bool(f.get("no_video")))
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+
+    @staticmethod
+    def _pick(combo, data):
+        idx = combo.findData(data)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+    @staticmethod
+    def _pick_range(combo, lo, hi):
+        for i in range(combo.count()):
+            if combo.itemData(i) == (lo, hi):
+                combo.setCurrentIndex(i)
+                return
+        combo.setCurrentIndex(0)      # custom/unknown range -> "Any"
 
 
 # ----------------------------------------------------------------------------
@@ -2097,6 +1294,29 @@ class SettingsDialog(QDialog):
         self.auto_open.setChecked(settings.value("auto_open", "false") == "true")
         form.addRow("", self.auto_open)
 
+        # Accent colour (theme). Restart-free: applied immediately on save.
+        self.accent = QComboBox()
+        for label, val in ACCENTS:
+            self.accent.addItem(label, val)
+        cur_accent = settings.value("accent", "synthwave")
+        self.accent.setCurrentIndex(max(0, self.accent.findData(cur_accent)))
+        form.addRow("Accent theme", self.accent)
+
+        # Optional osu! API credentials (client-credentials grant): enables higher
+        # rate limits + authoritative data and the "check for map updates" feature.
+        self.client_id = QLineEdit(settings.value("client_id", ""))
+        self.client_id.setPlaceholderText("optional — from osu.ppy.sh/home/account/edit → OAuth")
+        form.addRow("osu! API client ID", self.client_id)
+        self.client_secret = QLineEdit(settings.value("client_secret", ""))
+        self.client_secret.setEchoMode(QLineEdit.Password)
+        self.client_secret.setPlaceholderText("optional — client secret")
+        cs_row = QHBoxLayout()
+        cs_row.addWidget(self.client_secret, 1)
+        test_btn = QPushButton("Test")
+        test_btn.clicked.connect(self._test_api)
+        cs_row.addWidget(test_btn)
+        form.addRow("osu! API client secret", self._wrap(cs_row))
+
         hint = QLabel("Maps download into the Songs folder, which is also scanned to mark what "
                       "you already have (auto-detects osu-wine / lazer / Windows / macOS).\n\n"
                       "collection.db is your osu!stable collection file (usually in the osu! root, "
@@ -2149,12 +1369,275 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "Auto-detect",
                 "No osu! Songs folder found in common locations. Pick it manually.")
 
+    def _test_api(self):
+        cid = self.client_id.text().strip()
+        secret = self.client_secret.text().strip()
+        if not cid or not secret:
+            QMessageBox.information(self, "osu! API",
+                                    "Enter both a client ID and secret first.")
+            return
+        try:
+            fetch_oauth_token(cid, secret)
+        except Exception as e:  # noqa: BLE001
+            log.info("osu! API test failed: %s", e)
+            QMessageBox.warning(self, "osu! API",
+                                f"Couldn't authenticate:\n{type(e).__name__}: {e}")
+            return
+        QMessageBox.information(self, "osu! API",
+                                "Success — credentials work. Update checks are enabled.")
+
     def _save(self):
         self.settings.setValue("songs_dir", self.songs_dir.text().strip())
         self.settings.setValue("collection_db", self.collection_db.text().strip())
         self.settings.setValue("concurrency", self.concurrency.value())
         self.settings.setValue("auto_open", "true" if self.auto_open.isChecked() else "false")
+        self.settings.setValue("accent", self.accent.currentData())
+        self.settings.setValue("client_id", self.client_id.text().strip())
+        self.settings.setValue("client_secret", self.client_secret.text().strip())
         self.accept()
+
+
+# ----------------------------------------------------------------------------
+# COLLECTION MANAGER
+# ----------------------------------------------------------------------------
+class CollectionManagerDialog(QDialog):
+    """View and edit the collections inside osu!stable's collection.db:
+    rename, delete, or merge several into one. Every action backs up first."""
+
+    def __init__(self, db_path: Path, songs_dir: str, parent=None):
+        super().__init__(parent)
+        self.db_path = Path(db_path)
+        self.setWindowTitle("Collection manager")
+        self.resize(460, 560)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(10)
+
+        self.head = QLabel("")
+        self.head.setObjectName("packlabel")
+        self.head.setWordWrap(True)
+        lay.addWidget(self.head)
+
+        stats = library_stats(songs_dir)
+        self.stats_label = QLabel(
+            f"Library: {stats['count']} beatmapsets · "
+            f"{fmt_size(stats['osz_bytes'])} of .osz in the download folder")
+        self.stats_label.setObjectName("dockempty")
+        lay.addWidget(self.stats_label)
+
+        self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        lay.addWidget(self.list, 1)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+        for text, slot in [("Rename", self._rename), ("Delete", self._delete),
+                           ("Merge selected", self._merge)]:
+            b = QPushButton(text)
+            b.setObjectName("smallbtn")
+            b.clicked.connect(slot)
+            btns.addWidget(b)
+        btns.addStretch(1)
+        close = QPushButton("Close")
+        close.setObjectName("smallbtn")
+        close.clicked.connect(self.accept)
+        btns.addWidget(close)
+        lay.addLayout(btns)
+
+        note = QLabel("Close osu! before editing, then reopen (press F5 in song "
+                      "select if a change doesn't show). A .bak backup is kept.")
+        note.setObjectName("dockempty")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+
+        self._reload()
+
+    def _reload(self):
+        self.list.clear()
+        if not self.db_path.exists():
+            self.head.setText(f"No collection.db found at {self.db_path}. "
+                              "Build one via a pack, or set the path in Settings.")
+            return
+        cols = list_collections(self.db_path)
+        self.head.setText(f"{len(cols)} collection(s) in {self.db_path}")
+        for name, count in cols:
+            item = QListWidgetItem(f"{name}   —   {count} maps")
+            item.setData(Qt.UserRole, name)
+            self.list.addItem(item)
+
+    def _selected_names(self):
+        return [i.data(Qt.UserRole) for i in self.list.selectedItems()]
+
+    def _guard(self):
+        if not self.db_path.exists():
+            QMessageBox.information(self, "No collection.db",
+                                    "There's no collection.db to edit yet.")
+            return False
+        return True
+
+    def _rename(self):
+        if not self._guard():
+            return
+        names = self._selected_names()
+        if len(names) != 1:
+            QMessageBox.information(self, "Rename", "Select exactly one collection to rename.")
+            return
+        old = names[0]
+        new, ok = QInputDialog.getText(self, "Rename collection", "New name:", text=old)
+        new = (new or "").strip()
+        if not ok or not new or new == old:
+            return
+        try:
+            rename_collection(self.db_path, old, new)
+        except Exception as e:  # noqa: BLE001
+            log.exception("rename collection failed")
+            QMessageBox.critical(self, "Error", f"Couldn't rename:\n{e}")
+        self._reload()
+
+    def _delete(self):
+        if not self._guard():
+            return
+        names = self._selected_names()
+        if not names:
+            QMessageBox.information(self, "Delete", "Select one or more collections to delete.")
+            return
+        if QMessageBox.question(
+                self, "Delete collections?",
+                "Delete these collections?\n\n• " + "\n• ".join(names)
+                + "\n\nThe maps stay on disk; only the collections are removed.",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel) != QMessageBox.Yes:
+            return
+        try:
+            for n in names:
+                delete_collection(self.db_path, n)
+        except Exception as e:  # noqa: BLE001
+            log.exception("delete collection failed")
+            QMessageBox.critical(self, "Error", f"Couldn't delete:\n{e}")
+        self._reload()
+
+    def _merge(self):
+        if not self._guard():
+            return
+        names = self._selected_names()
+        if len(names) < 2:
+            QMessageBox.information(self, "Merge",
+                                    "Select two or more collections to merge (Ctrl/Shift-click).")
+            return
+        target, ok = QInputDialog.getText(
+            self, "Merge collections", "Name for the merged collection:", text=names[0])
+        target = (target or "").strip()
+        if not ok or not target:
+            return
+        try:
+            count = merge_collections(self.db_path, names, into=target)
+        except Exception as e:  # noqa: BLE001
+            log.exception("merge collections failed")
+            QMessageBox.critical(self, "Error", f"Couldn't merge:\n{e}")
+            return
+        QMessageBox.information(self, "Merged",
+                                f"“{target}” now has {count} maps.")
+        self._reload()
+
+
+# ----------------------------------------------------------------------------
+# BEATMAP DETAIL PANEL
+# ----------------------------------------------------------------------------
+class DetailDialog(QDialog):
+    """Expanded view of one beatmapset: every difficulty and quick actions,
+    including scoped searches for more maps by the same mapper or artist."""
+    downloadRequested = Signal(object)
+    searchRequested = Signal(str, str)      # option ("creator"/"artist"), text
+
+    def __init__(self, s: Beatmapset, owned: bool, parent=None):
+        super().__init__(parent)
+        self.s = s
+        self.setWindowTitle(f"{s.artist} - {s.title}" if s.artist else s.title)
+        self.resize(560, 520)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 16)
+        lay.setSpacing(10)
+
+        title = QLabel(f"<b style='font-size:17px'>{_esc(s.title)}</b>")
+        title.setWordWrap(True)
+        lay.addWidget(title)
+        artist = QLabel(_esc(s.artist))
+        artist.setObjectName("meta")
+        lay.addWidget(artist)
+
+        meta_bits = []
+        if s.creator:
+            meta_bits.append(f"mapped by {_esc(s.creator)}")
+        if s.status:
+            meta_bits.append(s.status)
+        if s.bpm:
+            meta_bits.append(f"{int(s.bpm)} BPM")
+        if s.play_count or s.favourite_count:
+            meta_bits.append(f"▶ {fmt_count(s.play_count)}   ♥ {fmt_count(s.favourite_count)}")
+        sub = QLabel("   ·   ".join(meta_bits))
+        sub.setObjectName("sub")
+        sub.setWordWrap(True)
+        lay.addWidget(sub)
+        if owned:
+            own = QLabel("✓ In your library")
+            own.setStyleSheet("color:#7ac74f; font-weight:700;")
+            lay.addWidget(own)
+
+        diff_head = QLabel(f"Difficulties ({len(s.diffs)})")
+        diff_head.setObjectName("panelhead")
+        lay.addWidget(diff_head)
+        self.diffs = QListWidget()
+        lay.addWidget(self.diffs, 1)
+        if s.diffs:
+            for d in sorted(s.diffs, key=lambda d: d.sr):
+                mode = MODE_NAME.get(d.mode, d.mode)
+                length = f"  ·  {fmt_len(d.length)}" if d.length else ""
+                self.diffs.addItem(f"★ {d.sr:.2f}   [{mode}]  {d.version}{length}")
+        else:
+            self.diffs.addItem("No per-difficulty data for this set.")
+
+        # actions
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+        self.dl_btn = QPushButton("Download")
+        self.dl_btn.setObjectName("primary")
+        self.dl_btn.clicked.connect(self._download)
+        btns.addWidget(self.dl_btn)
+        if s.creator:
+            b = QPushButton("More by mapper")
+            b.setObjectName("smallbtn")
+            b.clicked.connect(lambda: self._search("creator", s.creator))
+            btns.addWidget(b)
+        if s.artist:
+            b = QPushButton("More by artist")
+            b.setObjectName("smallbtn")
+            b.clicked.connect(lambda: self._search("artist", s.artist))
+            btns.addWidget(b)
+        web = QPushButton("Open on osu!")
+        web.setObjectName("smallbtn")
+        web.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(WEB_SET_URL.format(id=s.id))))
+        btns.addWidget(web)
+        btns.addStretch(1)
+        close = QPushButton("Close")
+        close.setObjectName("smallbtn")
+        close.clicked.connect(self.accept)
+        btns.addWidget(close)
+        lay.addLayout(btns)
+
+    def _download(self):
+        self.downloadRequested.emit(self.s)
+        self.dl_btn.setText("Queued ✓")
+        self.dl_btn.setEnabled(False)
+
+    def _search(self, option, text):
+        self.searchRequested.emit(option, text)
+        self.accept()
+
+
+def _esc(text: str) -> str:
+    """Minimal HTML escape for rich-text labels."""
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ----------------------------------------------------------------------------
@@ -2194,6 +1677,7 @@ class MainWindow(QMainWindow):
         self.dl_rows = {}          # setid -> DownloadRow
         self.dl_workers = {}       # setid -> active DownloadWorker
         self.dl_pending = []       # list[Beatmapset] waiting for a free slot
+        self.dl_failed = {}        # setid -> Beatmapset for failed (retryable) items
         self.dl_paused = False
         self.dl_concurrency = int(self.settings.value("concurrency", 3))
         self.downloaded_ids = set()
@@ -2201,12 +1685,18 @@ class MainWindow(QMainWindow):
         self.pack = None           # active medal-pack session, or None
 
         # persistent download history (also marks lazer imports / other machines)
-        self.history_path = Path(self.settings.fileName()).parent / "download_history.json"
+        cfg_dir = Path(self.settings.fileName()).parent
+        self.history_path = cfg_dir / "download_history.json"
         self.history_ids = load_history(self.history_path)
+        self.queue_path = cfg_dir / "download_queue.json"
 
         self._build_ui()
         self._setup_audio()
+        self._setup_tray()
+        self._setup_shortcuts()
+        self._restore_last_filters()
         self._refresh_downloaded()
+        self._restore_queue()
         QTimer.singleShot(0, self.new_search)  # initial A-Z-ish load
 
     # -- UI -----------------------------------------------------------------
@@ -2217,12 +1707,19 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # Resolve the theme first so the accent globals are set before widgets that
+        # read them (the search-box glow, the wordmark) are built.
+        style = themed_style(self.settings.value("accent", "synthwave"))
+
         self.filter_bar = FilterBar()
         self.filter_bar.searchRequested.connect(self.new_search)
         self.filter_bar.medalPacksRequested.connect(self._open_medal_packs)
         self.filter_bar.beatmapPacksRequested.connect(self._open_beatmap_packs)
         self.filter_bar.mostPlayedRequested.connect(self._open_most_played)
+        self.filter_bar.randomRequested.connect(self._open_random)
         root.addWidget(self.filter_bar)
+        self._setup_search_history()
+        self._rebuild_presets_menu()
 
         rule = QFrame()
         rule.setObjectName("neonrule")
@@ -2288,6 +1785,12 @@ class MainWindow(QMainWindow):
         self.cancel_all_btn.clicked.connect(self.cancel_all)
         head.addWidget(self.cancel_all_btn)
         head.addStretch(1)
+        self.retry_btn = QPushButton("Retry failed")
+        self.retry_btn.setObjectName("dockbtn")
+        self.retry_btn.setToolTip("Re-queue every download that failed")
+        self.retry_btn.clicked.connect(self.retry_failed)
+        self.retry_btn.setEnabled(False)
+        head.addWidget(self.retry_btn)
         clear = QPushButton("Clear finished")
         clear.setObjectName("dockbtn")
         clear.clicked.connect(self._clear_finished)
@@ -2339,12 +1842,22 @@ class MainWindow(QMainWindow):
             self.vol_slider.setToolTip("Preview volume")
             self.vol_slider.valueChanged.connect(self._set_volume)
             self.status.addPermanentWidget(self.vol_slider)
+        self.updates_btn = QPushButton("⟳ Updates")
+        self.updates_btn.setObjectName("smallbtn")
+        self.updates_btn.setToolTip("Check your downloaded .osz files for newer versions online")
+        self.updates_btn.clicked.connect(self._check_updates)
+        self.status.addPermanentWidget(self.updates_btn)
+        collections_btn = QPushButton("\U0001F5C2 Collections")
+        collections_btn.setObjectName("smallbtn")
+        collections_btn.setToolTip("View, rename, delete or merge your osu! collections")
+        collections_btn.clicked.connect(self._open_collections)
+        self.status.addPermanentWidget(collections_btn)
         settings_btn = QPushButton("\u2699 Settings")
         settings_btn.setObjectName("smallbtn")
         settings_btn.clicked.connect(self._open_settings)
         self.status.addPermanentWidget(settings_btn)
 
-        self.setStyleSheet(STYLE)
+        self.setStyleSheet(style)
 
     def _setup_audio(self):
         self.player = None
@@ -2361,6 +1874,64 @@ class MainWindow(QMainWindow):
         if getattr(self, "audio_out", None):
             self.audio_out.setVolume(v / 100)
 
+    # -- tray / shortcuts / session ----------------------------------------
+    def _setup_tray(self):
+        self.tray = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.SP_ArrowDown)
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip(APP_TITLE)
+        menu = QMenu()
+        menu.addAction("Show / hide window", self._toggle_visible)
+        menu.addSeparator()
+        menu.addAction("Quit", QApplication.quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda reason: self._toggle_visible()
+            if reason == QSystemTrayIcon.Trigger else None)
+        self.tray.show()
+
+    def _toggle_visible(self):
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+
+    def _notify(self, title: str, msg: str):
+        if getattr(self, "tray", None):
+            self.tray.showMessage(title, msg, QSystemTrayIcon.Information, 4000)
+
+    def _setup_shortcuts(self):
+        def sc(seq, fn):
+            QShortcut(QKeySequence(seq), self).activated.connect(fn)
+        sc("Ctrl+F", self._focus_search)
+        sc("F5", self.new_search)
+        sc("Ctrl+R", self._open_random)
+        sc("Ctrl+D", self.download_all_shown)
+        sc("Ctrl+Shift+C", self._open_collections)
+        sc("Ctrl+,", self._open_settings)
+        sc("Escape", self.stop_preview)
+
+    def _focus_search(self):
+        self.filter_bar.query.setFocus()
+        self.filter_bar.query.selectAll()
+
+    def _restore_last_filters(self):
+        raw = self.settings.value("last_filters", "")
+        if not raw:
+            return
+        try:
+            f = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return
+        if isinstance(f, dict):
+            self.filter_bar.set_filters(f)
+
     # -- searching ----------------------------------------------------------
     def _clear_grid(self):
         while self.flow.count():
@@ -2376,6 +1947,7 @@ class MainWindow(QMainWindow):
         card = BeatmapCard(s, owned)
         card.previewRequested.connect(self.preview)
         card.downloadRequested.connect(self.enqueue_download)
+        card.detailsRequested.connect(self._open_details)
         self.flow.addWidget(card)
         self.cards[s.id] = card
         # Covers are loaded lazily for cards near the viewport (see
@@ -2388,6 +1960,8 @@ class MainWindow(QMainWindow):
         if self.pack:
             self._exit_pack_mode(refresh=False)
         self.cur_filters = self.filter_bar.filters()
+        self._push_history(self.cur_filters.get("q", ""))
+        self.settings.setValue("last_filters", json.dumps(self.cur_filters))
         self.cursor_token = None
         self.more = True
         self.auto_pages = 0
@@ -2636,9 +2210,34 @@ class MainWindow(QMainWindow):
                                 "No beatmap files were found to hash, so no collection "
                                 "was created. Check that the downloads succeeded.")
             return
+
+        # Dry-run: show exactly what will change before we touch collection.db.
+        name = pk["medal"]
+        prev = preview_collection_merge(db_path, name, hashes)
+        verb = "Replace" if prev["replacing"] else "Create"
+        lines = [f"{verb} collection “{name}” with {prev['new_maps']} maps."]
+        if prev["replacing"]:
+            lines.append(f"The existing “{name}” ({prev['old_maps']} maps) "
+                         "will be overwritten.")
+        if prev["kept"]:
+            lines.append(f"{len(prev['kept'])} other collection(s) "
+                         f"({sum(c for _, c in prev['kept'])} maps) will be kept.")
+        if prev["db_exists"]:
+            lines.append("A .bak backup of the current collection.db will be written first.")
+        else:
+            lines.append("A new collection.db will be created (osu! not detected here — "
+                         "check the path in Settings if this looks wrong).")
+        lines.append(f"\nFile: {db_path}")
+        confirm = QMessageBox.question(
+            self, "Write collection?", "\n".join(lines),
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
+        if confirm != QMessageBox.Yes:
+            return
+
         try:
-            status = upsert_collection(db_path, pk["medal"], hashes)
+            status = upsert_collection(db_path, name, hashes)
         except Exception as e:  # noqa: BLE001
+            log.exception("collection write to %s failed", db_path)
             QMessageBox.critical(self, "Collection error",
                                  f"Couldn't write the collection:\n{type(e).__name__}: {e}")
             return
@@ -2760,6 +2359,7 @@ class MainWindow(QMainWindow):
         old = self.dl_rows.pop(s.id, None)
         if old is not None:
             old.deleteLater()
+        self.dl_failed.pop(s.id, None)
 
         row = DownloadRow(s)
         row.cancelRequested.connect(self.cancel_download)
@@ -2769,7 +2369,48 @@ class MainWindow(QMainWindow):
         if s.id in self.cards:
             self.cards[s.id].mark_queued()
         self._update_dock_empty()
+        self._update_retry_btn()
+        self._persist_queue()
         self._pump()
+
+    def retry_failed(self):
+        """Re-queue every download that failed (not the ones you cancelled)."""
+        failed = list(self.dl_failed.values())
+        self.dl_failed.clear()
+        for s in failed:
+            self.enqueue_download(s)
+        self._update_retry_btn()
+
+    def _update_retry_btn(self):
+        if hasattr(self, "retry_btn"):
+            self.retry_btn.setEnabled(bool(self.dl_failed))
+
+    # -- queue persistence --------------------------------------------------
+    def _persist_queue(self):
+        """Save everything not yet finished (pending + in-flight) so a batch can
+        be resumed after a restart; the .part files let it pick up mid-file."""
+        active = [w.s for w in self.dl_workers.values()]
+        save_queue(self.queue_path, active + list(self.dl_pending))
+
+    def _restore_queue(self):
+        sets = load_queue(self.queue_path)
+        if not sets:
+            return
+        # Restore rows but start paused, so nothing downloads unprompted on launch.
+        self.dl_paused = True
+        for s in sets:
+            if s.id in self.downloaded_ids:
+                continue
+            row = DownloadRow(s)
+            row.cancelRequested.connect(self.cancel_download)
+            self.dl_layout.insertWidget(self.dl_layout.count() - 1, row)
+            self.dl_rows[s.id] = row
+            self.dl_pending.append(s)
+        if self.dl_pending:
+            self.pause_btn.setText("Resume")
+            self._update_dock_empty()
+            self.status_label.setText(
+                f"Restored {len(self.dl_pending)} queued download(s) — press Resume to continue.")
 
     def _update_dock_empty(self):
         self.dl_empty.setVisible(not self.dl_rows)
@@ -2809,6 +2450,7 @@ class MainWindow(QMainWindow):
 
     def cancel_download(self, setid: int):
         self.dl_pending = [p for p in self.dl_pending if p.id != setid]
+        self.dl_failed.pop(setid, None)
         worker = self.dl_workers.get(setid)
         if worker:                       # in-flight: ask it to stop (emits failed "cancelled")
             worker.cancel()
@@ -2819,10 +2461,13 @@ class MainWindow(QMainWindow):
             if setid in self.cards:
                 self.cards[setid].set_downloaded(setid in self.downloaded_ids)
             self._pump()
+        self._update_retry_btn()
+        self._persist_queue()
 
     def cancel_all(self):
         pending = self.dl_pending
         self.dl_pending = []
+        self.dl_failed.clear()
         for s in pending:
             row = self.dl_rows.get(s.id)
             if row:
@@ -2831,6 +2476,8 @@ class MainWindow(QMainWindow):
                 self.cards[s.id].set_downloaded(s.id in self.downloaded_ids)
         for worker in list(self.dl_workers.values()):
             worker.cancel()
+        self._update_retry_btn()
+        self._persist_queue()
 
     @Slot(int, int, str)
     def _on_dl_progress(self, setid, pct, status):
@@ -2853,11 +2500,15 @@ class MainWindow(QMainWindow):
         if self.settings.value("auto_open", "false") == "true":
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
         self._pack_map_finished(setid, path)
+        self._persist_queue()
         self._pump()
+        if not self.dl_workers and not self.dl_pending and not self.dl_failed:
+            self._notify(APP_TITLE, "All downloads finished.")
 
     @Slot(int, str)
     def _on_dl_failed(self, setid, err):
         row = self.dl_rows.get(setid)
+        worker = self.dl_workers.get(setid)
         if err == "cancelled":
             if row:
                 row.set_cancelled()
@@ -2868,7 +2519,10 @@ class MainWindow(QMainWindow):
                 row.set_failed(err)
             if setid in self.cards:
                 self.cards[setid].mark_failed()
+            if worker is not None:            # remember it so "Retry failed" can re-queue
+                self.dl_failed[setid] = worker.s
         self.dl_workers.pop(setid, None)
+        self._update_retry_btn()
         # a pack map that won't arrive shouldn't stall the collection build
         if err == "cancelled" and self.pack and self.pack.get("collecting"):
             # cancelling the queue aborts the whole collection build
@@ -2877,6 +2531,7 @@ class MainWindow(QMainWindow):
             self.pack_dl_btn.setEnabled(True)
         else:
             self._pack_map_finished(setid, None)
+        self._persist_queue()
         self._pump()
 
     def _clear_finished(self):
@@ -2896,21 +2551,187 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self.dl_concurrency = int(self.settings.value("concurrency", 3))
             self.dl_pool.setMaxThreadCount(self.dl_concurrency)
+            self.setStyleSheet(themed_style(self.settings.value("accent", "synthwave")))
             self._refresh_downloaded()
             self.new_search()
             self._pump()
+
+    def _open_collections(self):
+        db_path = self._collection_db_path(prompt=False)
+        CollectionManagerDialog(db_path, self.settings.value("songs_dir", ""), self).exec()
+        self._refresh_downloaded()
+
+    def _open_details(self, s: Beatmapset):
+        dlg = DetailDialog(s, s.id in self.downloaded_ids, self)
+        dlg.downloadRequested.connect(self.enqueue_download)
+        dlg.searchRequested.connect(self._search_field)
+        dlg.exec()
+
+    # -- map update checking ------------------------------------------------
+    def _update_fetch_fn(self):
+        """A fetch(set_id)->Beatmapset with authoritative checksums: the official
+        API if credentials are set, else osu.direct."""
+        cid = (self.settings.value("client_id") or "").strip()
+        secret = (self.settings.value("client_secret") or "").strip()
+        if cid and secret:
+            token = fetch_oauth_token(cid, secret)     # once per scan
+            return lambda sid: osu_api_beatmapset(sid, token)
+        return lambda sid: fetch_card_meta(sid)[1]
+
+    def _check_updates(self):
+        songs = (self.settings.value("songs_dir") or "").strip()
+        if not songs or not Path(songs).is_dir():
+            QMessageBox.information(self, "Check for updates",
+                                    "Set your Songs / download folder in Settings first.")
+            return
+        self.updates_btn.setEnabled(False)
+        self.status_label.setText("Checking your downloaded maps for updates…")
+
+        def job():
+            return scan_local_updates(songs, self._update_fetch_fn(), cap=300)
+
+        w = Worker(job)
+        w.signals.result.connect(self._on_updates_found)
+        w.signals.error.connect(self._on_updates_error)
+        self.pool.start(w)
+
+    @Slot(str)
+    def _on_updates_error(self, msg):
+        self.updates_btn.setEnabled(True)
+        self.status_label.setText(f"Update check failed: {msg}")
+
+    @Slot(object)
+    def _on_updates_found(self, sets):
+        self.updates_btn.setEnabled(True)
+        if not sets:
+            self.status_label.setText("Your downloaded maps are up to date.")
+            QMessageBox.information(self, "Check for updates",
+                                    "Everything's up to date (checked .osz files only).")
+            return
+        self.status_label.setText(f"{len(sets)} map(s) have updates available.")
+        preview = "\n".join(f"• {s.artist} - {s.title}" for s in sets[:25])
+        if len(sets) > 25:
+            preview += f"\n… and {len(sets) - 25} more"
+        if QMessageBox.question(
+                self, "Updates available",
+                f"{len(sets)} downloaded map(s) have a newer version online:\n\n{preview}"
+                "\n\nRe-download them now?",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes) == QMessageBox.Yes:
+            for s in sets:
+                self.enqueue_download(s)
+
+    def _search_field(self, option: str, text: str):
+        """Run a scoped search (e.g. all maps by a mapper/artist) from a detail panel."""
+        fb = self.filter_bar
+        fb.query.setText(text)
+        for combo, data in ((fb.search_in, option), (fb.status, "all")):
+            idx = combo.findData(data)
+            if idx >= 0:
+                combo.blockSignals(True)      # avoid firing a search per change
+                combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
+        self.new_search()
+
+    # -- random / surprise me ----------------------------------------------
+    def _open_random(self):
+        """Open the detail panel for a random map among the current results."""
+        if not self.cards:
+            self.status_label.setText("Search something first, then hit 🎲.")
+            return
+        s = random.choice(list(self.cards.values())).s
+        self._open_details(s)
+
+    # -- search history -----------------------------------------------------
+    def _setup_search_history(self):
+        from PySide6.QtWidgets import QCompleter
+        self._history_model = QStringListModel(self._history_list())
+        completer = QCompleter(self._history_model, self)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        self.filter_bar.query.setCompleter(completer)
+
+    def _history_list(self):
+        return self.settings.value("search_history", []) or []
+
+    def _push_history(self, q: str):
+        q = (q or "").strip()
+        if not q:
+            return
+        hist = [h for h in self._history_list() if h.lower() != q.lower()]
+        hist.insert(0, q)
+        del hist[20:]                          # keep the 20 most recent
+        self.settings.setValue("search_history", hist)
+        if getattr(self, "_history_model", None) is not None:
+            self._history_model.setStringList(hist)
+
+    # -- filter presets -----------------------------------------------------
+    def _load_presets(self) -> dict:
+        raw = self.settings.value("filter_presets", "")
+        try:
+            return json.loads(raw) if raw else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _store_presets(self, presets: dict):
+        self.settings.setValue("filter_presets", json.dumps(presets))
+
+    def _rebuild_presets_menu(self):
+        menu = QMenu(self)
+        presets = self._load_presets()
+        for name in sorted(presets):
+            act = menu.addAction(name)
+            act.triggered.connect(lambda _=False, n=name: self._apply_preset(n))
+        if presets:
+            menu.addSeparator()
+        menu.addAction("Save current filters…", self._save_preset)
+        if presets:
+            menu.addAction("Delete a preset…", self._delete_preset)
+        self.filter_bar.presets_btn.setMenu(menu)
+
+    def _apply_preset(self, name: str):
+        presets = self._load_presets()
+        if name in presets:
+            self.filter_bar.set_filters(presets[name])
+            self.new_search()
+
+    def _save_preset(self):
+        name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        presets = self._load_presets()
+        presets[name] = self.filter_bar.filters()
+        self._store_presets(presets)
+        self._rebuild_presets_menu()
+        self.status_label.setText(f"Saved filter preset “{name}”.")
+
+    def _delete_preset(self):
+        presets = self._load_presets()
+        if not presets:
+            return
+        name, ok = QInputDialog.getItem(self, "Delete preset", "Preset:",
+                                        sorted(presets), 0, False)
+        if not ok or name not in presets:
+            return
+        del presets[name]
+        self._store_presets(presets)
+        self._rebuild_presets_menu()
 
 
 # ----------------------------------------------------------------------------
 # STYLE  (synthwave / osu! neon theme  -- pink x cyan on deep indigo)
 # ----------------------------------------------------------------------------
+# The stylesheet is a template: every colour is a ${token}. A theme supplies just
+# a few seed colours and _derive_palette() expands them into the full ~30-token
+# palette, so switching themes recolours the whole UI -- backgrounds, surfaces,
+# borders, text and both accents -- not merely the two highlight colours.
 STYLE = """
-* { font-family: "Inter", "Segoe UI", "Noto Sans", sans-serif; font-size: 12px; color: #f1ecfb; }
+* { font-family: "Inter", "Segoe UI", "Noto Sans", sans-serif; font-size: 12px; color: ${text}; }
 
-QMainWindow, QDialog { background: #100c1a; }
+QMainWindow, QDialog { background: ${bg}; }
 QWidget { background: transparent; }
 QMainWindow > QWidget, QDialog > QWidget {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #16101f, stop:1 #0e0a16);
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 ${bg2}, stop:1 ${bg_deep});
 }
 
 QScrollArea#results { background: transparent; border: none; }
@@ -2918,168 +2739,298 @@ QScrollArea { border: none; }
 
 /* ---- cards ---- */
 #card {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #221a35, stop:1 #1b1530);
-    border: 1px solid #342a4d; border-radius: 14px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 ${surface}, stop:1 ${surface2});
+    border: 1px solid ${border2}; border-radius: 14px;
 }
-#card:hover { border: 1px solid #ff66ab; }
+#card:hover { border: 1px solid ${accent}; }
 #card[owned="true"] {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1c2530, stop:1 #16202a);
-    border: 1px solid #2f4a48;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 ${owned_surface}, stop:1 ${owned_surface2});
+    border: 1px solid ${owned_border};
 }
 #cover {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2a2142, stop:0.5 #3a2350, stop:1 #2a2142);
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 ${cover_a}, stop:0.5 ${cover_b}, stop:1 ${cover_a});
     border-top-left-radius: 14px; border-top-right-radius: 14px;
-    color: #5b5078; font-size: 30px;
+    color: ${text_faint}; font-size: 30px;
 }
-#title { font-size: 17px; font-weight: 700; color: #ffffff; }
-#meta { color: #cabfe8; font-size: 14px; }
-#stats { color: #3fe3ff; font-size: 13px; font-weight: 600; }
-#sub { color: #9b90bd; font-size: 13px; }
+#title { font-size: 17px; font-weight: 700; color: ${text_bright}; }
+#meta { color: ${text_mid}; font-size: 14px; }
+#stats { color: ${accent2_soft}; font-size: 13px; font-weight: 600; }
+#sub { color: ${text_dim}; font-size: 13px; }
 
 /* ---- inputs ---- */
-#fieldlabel { color: #9a8fc0; font-size: 10px; font-weight: 800; }
+#fieldlabel { color: ${text_dim}; font-size: 10px; font-weight: 800; }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-    background: #241c39; border: 1px solid #3d3059; border-radius: 9px;
-    padding: 7px 11px; font-size: 13px; selection-background-color: #ff66ab; color: #f1ecfb;
+    background: ${input}; border: 1px solid ${border}; border-radius: 9px;
+    padding: 7px 11px; font-size: 13px; selection-background-color: ${accent}; color: ${text};
 }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #ff66ab; }
-QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover { border: 1px solid #5a4785; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid ${accent}; }
+QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover { border: 1px solid ${border_hi}; }
 QComboBox::drop-down { border: none; width: 22px; }
 QComboBox::down-arrow { width: 11px; height: 11px; }
 QComboBox QAbstractItemView {
-    background: #1d1730; border: 1px solid #382c52; selection-background-color: #ff66ab;
-    selection-color: #14101e; outline: none; padding: 4px;
+    background: ${input2}; border: 1px solid ${border2}; selection-background-color: ${accent};
+    selection-color: ${on_accent}; outline: none; padding: 4px;
 }
 QSpinBox::up-button, QDoubleSpinBox::up-button {
     subcontrol-origin: border; subcontrol-position: top right; width: 20px;
-    background: #2e2450; border-left: 1px solid #3d3059; border-top-right-radius: 9px;
+    background: ${raise2}; border-left: 1px solid ${border}; border-top-right-radius: 9px;
 }
 QSpinBox::down-button, QDoubleSpinBox::down-button {
     subcontrol-origin: border; subcontrol-position: bottom right; width: 20px;
-    background: #2e2450; border-left: 1px solid #3d3059; border-bottom-right-radius: 9px;
+    background: ${raise2}; border-left: 1px solid ${border}; border-bottom-right-radius: 9px;
 }
 QSpinBox::up-button:hover, QSpinBox::down-button:hover,
-QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { background: #ff66ab; }
+QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { background: ${accent}; }
 QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { width: 10px; height: 10px; }
 QSpinBox::down-arrow, QDoubleSpinBox::down-arrow { width: 10px; height: 10px; }
 #filterpanel {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1b1530, stop:1 #161025);
-    border: 1px solid #2f2548; border-radius: 13px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 ${surface2}, stop:1 ${bg2});
+    border: 1px solid ${border2}; border-radius: 13px;
 }
 #search {
     font-size: 15px; padding: 10px 15px; border-radius: 11px;
-    background: #1d1730; border: 1px solid #3a2c58;
+    background: ${input2}; border: 1px solid ${border2};
 }
-#search:focus { border: 1px solid #ff66ab; }
+#search:focus { border: 1px solid ${accent}; }
 
 /* ---- buttons ---- */
 QPushButton {
-    background: #2a2140; border: 1px solid #3d3059; border-radius: 8px;
-    padding: 6px 13px; color: #e7e0f7;
+    background: ${raise}; border: 1px solid ${border}; border-radius: 8px;
+    padding: 6px 13px; color: ${text_mid};
 }
-QPushButton:hover { background: #342752; border-color: #5a4785; }
-QPushButton:disabled { color: #6b6388; background: #221a33; border-color: #2e2545; }
+QPushButton:hover { background: ${raise2}; border-color: ${border_hi}; }
+QPushButton:disabled { color: ${text_dim}; background: ${surface2}; border-color: ${border2}; }
 QPushButton#primary, QPushButton#dlbtn {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff5fa6, stop:1 #ff86c0);
-    border: none; color: #19101c; font-weight: 700;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 ${accent}, stop:1 ${accent_soft});
+    border: none; color: ${on_accent}; font-weight: 700;
 }
 QPushButton#dlbtn { min-height: 36px; font-size: 14px; }
 QPushButton#primary:hover, QPushButton#dlbtn:hover {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff79b6, stop:1 #ff9bce);
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 ${accent_soft}, stop:1 ${accent_soft});
 }
 QPushButton#dlbtn:disabled {
-    background: #2a2140; color: #8a80aa; border: 1px solid #3d3059;
+    background: ${raise}; color: ${text_dim}; border: 1px solid ${border};
 }
 #card[owned="true"] QPushButton#dlbtn {
-    background: transparent; color: #58e0b0; border: 1px solid #2f5a4e;
+    background: transparent; color: ${owned}; border: 1px solid ${owned_border};
 }
 QPushButton#smallbtn { padding: 5px 11px; font-size: 11px; }
 QPushButton#medalbtn {
-    background: #241c39; border: 1px solid #36e0ff; border-radius: 11px;
-    padding: 9px 15px; font-size: 13px; font-weight: 700; color: #6fe9ff;
+    background: ${input}; border: 1px solid ${accent2}; border-radius: 11px;
+    padding: 9px 15px; font-size: 13px; font-weight: 700; color: ${accent2_soft};
 }
-QPushButton#medalbtn:hover { background: #36e0ff; color: #10131a; }
+QPushButton#medalbtn:hover { background: ${accent2}; color: ${on_accent2}; }
 #packbanner {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2a1733, stop:1 #1a1330);
-    border-bottom: 1px solid #ff66ab;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 ${surface}, stop:1 ${surface2});
+    border-bottom: 1px solid ${accent};
 }
-#packlabel { font-size: 15px; font-weight: 800; color: #ffd45e; }
+#packlabel { font-size: 15px; font-weight: 800; color: ${gold}; }
 
 /* circular preview / web buttons -- the osu! hitcircle motif */
 QToolButton#circbtn {
-    background: #241c39; border: 1px solid #ff66ab; border-radius: 18px;
-    min-width: 36px; min-height: 36px; max-height: 38px; color: #ff8cc4; font-size: 14px;
+    background: ${input}; border: 1px solid ${accent}; border-radius: 18px;
+    min-width: 36px; min-height: 36px; max-height: 38px; color: ${accent_soft}; font-size: 14px;
 }
-QToolButton#circbtn:hover { background: #ff66ab; color: #19101c; }
+QToolButton#circbtn:hover { background: ${accent}; color: ${on_accent}; }
 QToolButton#pillbtn {
-    background: #241c39; border: 1px solid #3d3059; border-radius: 8px;
-    padding: 6px 9px; color: #c3b9e0;
+    background: ${input}; border: 1px solid ${border}; border-radius: 8px;
+    padding: 6px 9px; color: ${text_mid};
 }
-QToolButton#pillbtn:hover { border-color: #36e0ff; color: #36e0ff; }
-QToolButton#xbtn { background: transparent; border: none; color: #8b81ab; padding: 0 4px; font-size: 13px; }
-QToolButton#xbtn:hover { color: #ff5f8f; }
+QToolButton#pillbtn:hover { border-color: ${accent2}; color: ${accent2}; }
+QToolButton#xbtn { background: transparent; border: none; color: ${text_dim}; padding: 0 4px; font-size: 13px; }
+QToolButton#xbtn:hover { color: ${accent}; }
 
 /* ---- identity ---- */
-#logo { color: #ff66ab; font-size: 22px; }
-#wordmark { color: #f1ecfb; font-size: 15px; font-weight: 800; }
+#logo { color: ${accent}; font-size: 22px; }
+#wordmark { color: ${text}; font-size: 15px; font-weight: 800; }
 #neonrule {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 rgba(255,102,171,0), stop:0.5 #ff66ab, stop:1 rgba(54,224,255,0.0));
+        stop:0 rgba(0,0,0,0), stop:0.5 ${accent}, stop:1 rgba(0,0,0,0));
     max-height: 2px; min-height: 2px; border: none;
 }
 
 /* ---- downloads dock (bottom) ---- */
-#dock { background: #0e0a18; border-top: 1px solid #2c2344; }
+#dock { background: ${bg_deep}; border-top: 1px solid ${border2}; }
 QScrollArea#dockscroll { background: transparent; }
-#panelhead { font-size: 15px; font-weight: 800; color: #ffffff; }
-#dockempty { color: #6f6790; font-size: 13px; }
+#panelhead { font-size: 15px; font-weight: 800; color: ${text_bright}; }
+#dockempty { color: ${text_faint}; font-size: 13px; }
 QPushButton#dockbtn {
-    background: #2a2140; border: 1px solid #3d3059; border-radius: 9px;
-    padding: 9px 17px; font-size: 13px; font-weight: 600; color: #e7e0f7;
+    background: ${raise}; border: 1px solid ${border}; border-radius: 9px;
+    padding: 9px 17px; font-size: 13px; font-weight: 600; color: ${text_mid};
 }
-QPushButton#dockbtn:hover { background: #36285a; border-color: #5a4785; }
+QPushButton#dockbtn:hover { background: ${raise2}; border-color: ${border_hi}; }
 #dlrow {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #221a35, stop:1 #1b1530);
-    border: 1px solid #342a4d; border-radius: 11px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 ${surface}, stop:1 ${surface2});
+    border: 1px solid ${border2}; border-radius: 11px;
 }
-#dlname { font-size: 12px; color: #e7e0f7; }
-#dlstatus { color: #8b81ab; font-size: 11px; }
-QProgressBar { background: #2a2140; border: none; border-radius: 3px; }
+#dlname { font-size: 12px; color: ${text_mid}; }
+#dlstatus { color: ${text_dim}; font-size: 11px; }
+QProgressBar { background: ${raise}; border: none; border-radius: 3px; }
 QProgressBar::chunk {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff66ab, stop:1 #36e0ff);
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 ${accent}, stop:1 ${accent2});
     border-radius: 3px;
 }
 
 /* ---- chrome ---- */
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ff66ab, stop:1 #b14bd0);
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 ${accent}, stop:1 ${scroll2});
     border-radius: 5px; min-height: 36px;
 }
-QScrollBar::handle:vertical:hover { background: #ff85c0; }
+QScrollBar::handle:vertical:hover { background: ${accent_soft}; }
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
-QStatusBar { background: #0c0813; border-top: 1px solid #271f3c; }
+QStatusBar { background: ${bg_deep}; border-top: 1px solid ${border2}; }
 QStatusBar::item { border: none; }
-QStatusBar QLabel { color: #b3a9d0; }
-#hint { color: #8b81ab; font-size: 11px; }
-QSplitter::handle { background: #271f3c; width: 1px; }
-QCheckBox { color: #d6cdf0; spacing: 8px; font-size: 12px; }
+QStatusBar QLabel { color: ${text_mid}; }
+#hint { color: ${text_dim}; font-size: 11px; }
+QSplitter::handle { background: ${border2}; width: 1px; }
+QCheckBox { color: ${text_mid}; spacing: 8px; font-size: 12px; }
 QCheckBox::indicator {
     width: 18px; height: 18px; border-radius: 5px;
-    border: 1px solid #3d3059; background: #241c39;
+    border: 1px solid ${border}; background: ${input};
 }
-QCheckBox::indicator:hover { border: 1px solid #ff66ab; }
-QCheckBox::indicator:checked { background: #ff66ab; border-color: #ff66ab; }
-QToolTip { background: #1d1730; color: #f1ecfb; border: 1px solid #ff66ab; padding: 4px 7px; }
-QSlider::groove:horizontal { height: 4px; background: #2a2140; border-radius: 2px; }
+QCheckBox::indicator:hover { border: 1px solid ${accent}; }
+QCheckBox::indicator:checked { background: ${accent}; border-color: ${accent}; }
+QToolTip { background: ${input2}; color: ${text}; border: 1px solid ${accent}; padding: 4px 7px; }
+QSlider::groove:horizontal { height: 4px; background: ${raise}; border-radius: 2px; }
 QSlider::sub-page:horizontal {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff66ab, stop:1 #36e0ff); border-radius: 2px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 ${accent}, stop:1 ${accent2}); border-radius: 2px;
 }
 QSlider::handle:horizontal {
-    background: #ffffff; width: 12px; height: 12px; margin: -5px 0; border-radius: 6px;
+    background: ${text_bright}; width: 12px; height: 12px; margin: -5px 0; border-radius: 6px;
 }
 """
+
+# ---- theme engine ----------------------------------------------------------
+# Each theme is four seed colours -- (background, surface, accent, accent2) --
+# from which _derive_palette() builds every token above. Add a theme by adding
+# one line to THEMES / THEME_SEEDS; the whole UI recolours coherently.
+def _hex2rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _rgb2hex(rgb):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, round(c))) for c in rgb)
+
+
+def _mix(a, b, t):
+    ra, rb = _hex2rgb(a), _hex2rgb(b)
+    return _rgb2hex(tuple(ra[i] + (rb[i] - ra[i]) * t for i in range(3)))
+
+
+def _lighten(c, t):
+    return _mix(c, "#ffffff", t)
+
+
+def _darken(c, t):
+    return _mix(c, "#000000", t)
+
+
+def _lum(c):
+    r, g, b = _hex2rgb(c)
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+
+
+def _readable_on(c):
+    """Dark ink on a light/bright colour, white on a dark one."""
+    return "#141019" if _lum(c) > 0.5 else "#ffffff"
+
+
+def _derive_palette(bg, surface, accent, accent2, owned="#5be3b0", gold="#ffd45e"):
+    return {
+        "bg": bg,
+        "bg_deep": _darken(bg, 0.30),
+        "bg2": _lighten(bg, 0.05),
+        "surface": surface,
+        "surface2": _darken(surface, 0.16),
+        "input": _darken(surface, 0.05),
+        "input2": _darken(surface, 0.13),
+        "raise": _lighten(surface, 0.05),
+        "raise2": _lighten(surface, 0.15),
+        "border": _lighten(surface, 0.16),
+        "border2": _lighten(surface, 0.07),
+        "border_hi": _mix(_lighten(surface, 0.20), accent, 0.40),
+        "text": _mix("#ffffff", surface, 0.10),
+        "text_bright": "#ffffff",
+        "text_mid": _mix("#ffffff", surface, 0.30),
+        "text_dim": _mix("#ffffff", surface, 0.50),
+        "text_faint": _mix("#ffffff", surface, 0.62),
+        "accent": accent,
+        "accent_soft": _lighten(accent, 0.18),
+        "accent2": accent2,
+        "accent2_soft": _lighten(accent2, 0.20),
+        "on_accent": _readable_on(accent),
+        "on_accent2": _readable_on(accent2),
+        "cover_a": _mix(surface, accent, 0.18),
+        "cover_b": _mix(surface, accent, 0.36),
+        "scroll2": _mix(accent, accent2, 0.5),
+        "gold": gold,
+        "owned": owned,
+        "owned_border": _mix(_darken(surface, 0.04), owned, 0.32),
+        "owned_surface": _mix(surface, owned, 0.10),
+        "owned_surface2": _darken(_mix(surface, owned, 0.10), 0.14),
+    }
+
+
+# label, key -- shown in Settings, in menu order.
+THEMES = [
+    ("Synthwave", "synthwave"),
+    ("Sunset", "sunset"),
+    ("Vaporwave", "vapor"),
+    ("Matrix", "matrix"),
+    ("Ice", "ice"),
+    ("Ember", "ember"),
+    ("Deep Sea", "deepsea"),
+    ("Forest", "forest"),
+    ("Dracula", "dracula"),
+    ("Royal Gold", "royal"),
+    ("Carbon", "carbon"),
+    ("Rose Gold", "rosegold"),
+    ("Neon Yellow", "neon"),
+    ("Bubblegum", "bubblegum"),
+    ("Blood Moon", "bloodmoon"),
+    ("Aurora", "aurora"),
+]
+# key -> (bg, surface, accent, accent2)
+THEME_SEEDS = {
+    "synthwave": ("#100c1a", "#221a35", "#ff66ab", "#36e0ff"),
+    "sunset":    ("#1a0f14", "#301b26", "#ff7a59", "#ffce54"),
+    "vapor":     ("#140f1e", "#271a3a", "#c774e8", "#41ead4"),
+    "matrix":    ("#08120b", "#122419", "#39ff77", "#9dffce"),
+    "ice":       ("#0b1220", "#172636", "#5b9dff", "#8ee3ff"),
+    "ember":     ("#160b0b", "#2b1616", "#ff5a4a", "#ffb347"),
+    "deepsea":   ("#08131a", "#10232e", "#22c7cf", "#4de3d0"),
+    "forest":    ("#0b140c", "#182a1c", "#7bd88f", "#d4e08a"),
+    "dracula":   ("#191322", "#2a2440", "#bd93f9", "#ff79c6"),
+    "royal":     ("#14110a", "#2a2416", "#e6c34d", "#9d8bff"),
+    "carbon":    ("#0e0e12", "#20212b", "#cfd3e0", "#8f93a8"),
+    "rosegold":  ("#170f10", "#2c1e22", "#f6a6b2", "#e8c07d"),
+    "neon":      ("#0e0f06", "#22240f", "#f6ff2a", "#22d3ff"),
+    "bubblegum": ("#150f16", "#2b1d33", "#ff8fd4", "#7cf0ff"),
+    "bloodmoon": ("#140a0d", "#291320", "#ff3b6b", "#ff9e64"),
+    "aurora":    ("#0a1016", "#152430", "#64ffda", "#a78bfa"),
+}
+
+from string import Template as _StyleTemplate
+
+_STYLE_TMPL = _StyleTemplate(STYLE)
+# Current accent hexes, updated by themed_style(); used for glow/wordmark that
+# aren't part of the stylesheet. Defaults keep the original look pre-first-theme.
+ACCENT_HEX = "#ff66ab"
+ACCENT2_HEX = "#36e0ff"
+# Back-compat alias: Settings reads ACCENTS as (label, key) pairs.
+ACCENTS = THEMES
+
+
+def themed_style(theme_key: str) -> str:
+    """Full stylesheet for a theme. Also refreshes the module-level accent hexes
+    used by the glow effect and wordmark."""
+    global ACCENT_HEX, ACCENT2_HEX
+    seeds = THEME_SEEDS.get(theme_key) or THEME_SEEDS["synthwave"]
+    ACCENT_HEX, ACCENT2_HEX = seeds[2], seeds[3]
+    return _STYLE_TMPL.substitute(_derive_palette(*seeds))
 
 
 def resource_path(name: str) -> str:
@@ -3090,14 +3041,21 @@ def resource_path(name: str) -> str:
 
 
 def main():
+    # Logging goes to stderr. Level defaults to WARNING; set CIRCLEWAVE_LOG=DEBUG
+    # (or INFO) to see mirror fallbacks, cover/download failures, etc.
+    logging.basicConfig(
+        level=os.environ.get("CIRCLEWAVE_LOG", "WARNING").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
     # Make Windows show our own taskbar icon instead of grouping under python.exe.
     if sys.platform == "win32":
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
                 f"{ORG_NAME}.{APP_NAME}")
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("could not set Windows AppUserModelID: %s", e)
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)

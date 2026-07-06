@@ -1,0 +1,57 @@
+name: Build Linux binary
+
+# Build manually from the Actions tab, or automatically when you push a vX.Y.Z tag.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+# Lets the workflow's GITHUB_TOKEN create/attach the GitHub Release.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -c constraints.txt pyinstaller
+
+      - name: Run tests
+        run: |
+          pip install pytest
+          python -m pytest -q
+
+      - name: Build binary
+        # Reuses circlewave.spec; PyInstaller follows the import into
+        # circlewave_core.py automatically. Produces dist/CircleWave.
+        run: pyinstaller circlewave.spec
+
+      - name: Package
+        run: |
+          cd dist
+          chmod +x CircleWave
+          tar czf CircleWave-linux-x86_64.tar.gz CircleWave
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CircleWave-linux
+          path: dist/CircleWave-linux-x86_64.tar.gz
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/CircleWave-linux-x86_64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
