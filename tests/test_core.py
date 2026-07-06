@@ -124,6 +124,34 @@ def test_upsert_writes_backup(tmp_path):
     assert bak.read_bytes() == original                # backup is the pre-write state
 
 
+def test_preview_collection_merge_new_db(tmp_path):
+    prev = c.preview_collection_merge(tmp_path / "collection.db", "Pack",
+                                      ["a" * 32, "a" * 32, "", "b" * 32])
+    assert prev["db_exists"] is False
+    assert prev["replacing"] is False
+    assert prev["new_maps"] == 2          # dupe + empty dropped
+    assert prev["old_maps"] == 0
+    assert prev["kept"] == []
+
+
+def test_preview_collection_merge_replacing(tmp_path):
+    db = tmp_path / "collection.db"
+    c.write_collection_db(db, c.DEFAULT_DB_VERSION,
+                          [("Keep", ["1" * 32, "2" * 32]), ("Pack", ["9" * 32])])
+    prev = c.preview_collection_merge(db, "Pack", ["a" * 32])
+    assert prev["db_exists"] is True
+    assert prev["replacing"] is True
+    assert prev["old_maps"] == 1
+    assert prev["new_maps"] == 1
+    assert prev["kept"] == [("Keep", 2)]
+
+
+def test_preview_does_not_write(tmp_path):
+    db = tmp_path / "collection.db"
+    c.preview_collection_merge(db, "Pack", ["a" * 32])
+    assert not db.exists()                # dry-run must not create the file
+
+
 def test_default_collection_db_path():
     p = c.default_collection_db_path("/home/u/osu/Songs")
     assert p.name == "collection.db"

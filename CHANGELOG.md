@@ -4,6 +4,29 @@ All notable changes to CircleWave are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Collection write preview** — before a `collection.db` is created or modified,
+  a confirmation dialog shows how many maps go in, whether a same-named collection
+  is being replaced, which others are kept, and where the file lands.
+- **Resumable downloads** — an interrupted or cancelled `.osz` keeps its partial
+  file and resumes via HTTP Range (from the same mirror), instead of restarting.
+- **pip / pipx install** — `pyproject.toml` exposes a `circlewave` console script.
+- **Linux release binary** built in CI (PyInstaller), attached to tagged releases.
+
+### Changed
+- **More reliable networking** — all requests share one pooled session with
+  automatic retry/backoff on rate-limits and 5xx; the osu.ppy.sh scraping paths
+  are politely throttled. Finished downloads are validated as real zips.
+- **lazer collections** — clarified that CircleWave's stable `collection.db` can be
+  imported into lazer via its Setup Wizard's Import step.
+
+### Internal
+- Split the Qt-free logic into `circlewave_core.py` with a `pytest` suite (49 tests);
+  builds now run the tests before packaging. Swallowed errors are now logged
+  (tunable via `CIRCLEWAVE_LOG`).
+
 ## [1.2.1] - 2026-06-23
 
 ### Changed

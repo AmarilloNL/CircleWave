@@ -21,7 +21,6 @@ import threading
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -803,7 +802,6 @@ def write_collection_db(path: Path, version: int, collections):
 
 def md5s_from_osz(osz_path) -> list:
     """MD5 (hex) of every .osu difficulty inside an .osz - matches osu!'s map hashes."""
-    import zipfile
     hashes = []
     try:
         with zipfile.ZipFile(osz_path) as z:
@@ -837,6 +835,33 @@ def upsert_collection(db_path: Path, name: str, hashes: list) -> str:
     collections.append((name, uniq))
     write_collection_db(db_path, version or DEFAULT_DB_VERSION, collections)
     return f"{len(uniq)} maps in collection \u201c{name}\u201d"
+
+
+def preview_collection_merge(db_path: Path, name: str, hashes: list) -> dict:
+    """Describe what upsert_collection() *would* do, without touching disk.
+
+    Lets the GUI show a confirmation before modifying a user's collection.db.
+    Returns a dict with:
+      db_exists   : bool  -- is there an existing collection.db to merge into
+      replacing   : bool  -- a collection with this name already exists
+      new_maps    : int   -- unique, non-empty hashes that will be in the collection
+      old_maps    : int   -- map count of the same-named collection being replaced
+      kept        : [(name, count), ...]  -- other collections left untouched
+    """
+    db_path = Path(db_path)
+    _, collections = read_collection_db(db_path)
+    seen, uniq = set(), []
+    for h in hashes:
+        if h and h not in seen:
+            seen.add(h); uniq.append(h)
+    existing = {n: h for (n, h) in collections}
+    return {
+        "db_exists": db_path.exists(),
+        "replacing": name in existing,
+        "new_maps": len(uniq),
+        "old_maps": len(existing.get(name, [])),
+        "kept": [(n, len(h)) for (n, h) in collections if n != name],
+    }
 
 
 def default_collection_db_path(songs_dir: str) -> Path:
