@@ -57,6 +57,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 import random
 import logging
 import tempfile
@@ -250,6 +251,7 @@ class DownloadWorker(QRunnable):
                         total = int(r.headers.get("Content-Length", 0) or 0)
 
                     meta.write_text(url)
+                    start_t, start_got, last_emit = time.monotonic(), got, 0.0
                     with open(tmp, mode) as fh:
                         for chunk in r.iter_content(chunk_size=65536):
                             if self._cancel.is_set():
@@ -260,8 +262,18 @@ class DownloadWorker(QRunnable):
                             if chunk:
                                 fh.write(chunk)
                                 got += len(chunk)
-                                pct = int(got * 100 / total) if total else -1
-                                self.signals.progress.emit(sid, pct, mirror["name"])
+                                now = time.monotonic()
+                                if now - last_emit >= 0.25:   # throttle UI updates
+                                    last_emit = now
+                                    pct = int(got * 100 / total) if total else -1
+                                    elapsed = now - start_t
+                                    speed = (got - start_got) / elapsed if elapsed > 0.5 else 0
+                                    status = mirror["name"]
+                                    if speed:
+                                        status += f"  ·  {fmt_speed(speed)}"
+                                        if total:
+                                            status += f"  ·  {fmt_eta((total - got) / speed)}"
+                                    self.signals.progress.emit(sid, pct, status)
 
                     if got < 1024 or not self._looks_like_zip(tmp):
                         last_err = f"{mirror['name']} returned an invalid/partial file"
@@ -1679,6 +1691,9 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._setup_audio()
+        self._setup_tray()
+        self._setup_shortcuts()
+        self._restore_last_filters()
         self._refresh_downloaded()
         self._restore_queue()
         QTimer.singleShot(0, self.new_search)  # initial A-Z-ish load
@@ -1849,6 +1864,64 @@ class MainWindow(QMainWindow):
         if getattr(self, "audio_out", None):
             self.audio_out.setVolume(v / 100)
 
+    # -- tray / shortcuts / session ----------------------------------------
+    def _setup_tray(self):
+        self.tray = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.SP_ArrowDown)
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip(APP_TITLE)
+        menu = QMenu()
+        menu.addAction("Show / hide window", self._toggle_visible)
+        menu.addSeparator()
+        menu.addAction("Quit", QApplication.quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda reason: self._toggle_visible()
+            if reason == QSystemTrayIcon.Trigger else None)
+        self.tray.show()
+
+    def _toggle_visible(self):
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+
+    def _notify(self, title: str, msg: str):
+        if getattr(self, "tray", None):
+            self.tray.showMessage(title, msg, QSystemTrayIcon.Information, 4000)
+
+    def _setup_shortcuts(self):
+        def sc(seq, fn):
+            QShortcut(QKeySequence(seq), self).activated.connect(fn)
+        sc("Ctrl+F", self._focus_search)
+        sc("F5", self.new_search)
+        sc("Ctrl+R", self._open_random)
+        sc("Ctrl+D", self.download_all_shown)
+        sc("Ctrl+Shift+C", self._open_collections)
+        sc("Ctrl+,", self._open_settings)
+        sc("Escape", self.stop_preview)
+
+    def _focus_search(self):
+        self.filter_bar.query.setFocus()
+        self.filter_bar.query.selectAll()
+
+    def _restore_last_filters(self):
+        raw = self.settings.value("last_filters", "")
+        if not raw:
+            return
+        try:
+            f = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return
+        if isinstance(f, dict):
+            self.filter_bar.set_filters(f)
+
     # -- searching ----------------------------------------------------------
     def _clear_grid(self):
         while self.flow.count():
@@ -1878,6 +1951,7 @@ class MainWindow(QMainWindow):
             self._exit_pack_mode(refresh=False)
         self.cur_filters = self.filter_bar.filters()
         self._push_history(self.cur_filters.get("q", ""))
+        self.settings.setValue("last_filters", json.dumps(self.cur_filters))
         self.cursor_token = None
         self.more = True
         self.auto_pages = 0
@@ -2418,6 +2492,8 @@ class MainWindow(QMainWindow):
         self._pack_map_finished(setid, path)
         self._persist_queue()
         self._pump()
+        if not self.dl_workers and not self.dl_pending and not self.dl_failed:
+            self._notify(APP_TITLE, "All downloads finished.")
 
     @Slot(int, str)
     def _on_dl_failed(self, setid, err):
