@@ -7,6 +7,11 @@ on:
     tags:
       - 'v*'
 
+# Lets the workflow's GITHUB_TOKEN create the GitHub Release (otherwise it's
+# read-only and "Attach to release" fails with a 403 "Resource not accessible").
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
