@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "circlewave"
+version = "1.2.1"
+description = "A synthwave-themed desktop browser & batch downloader for osu! beatmaps."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "AmarilloNL" }]
+license = { text = "GPL-3.0-or-later" }
+keywords = ["osu", "beatmap", "downloader", "pyside6", "qt"]
+classifiers = [
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Games/Entertainment",
+]
+dependencies = [
+    "PySide6>=6.5",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/AmarilloNL/CircleWave"
+Releases = "https://github.com/AmarilloNL/CircleWave/releases"
+
+# Launch the GUI with `circlewave` once installed (pipx install . / pip install .).
+[project.scripts]
+circlewave = "circlewave:main"
+
+# Flat layout: two top-level modules, no package directory.
+[tool.setuptools]
+py-modules = ["circlewave", "circlewave_core"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,7 @@
+# Pinned versions for reproducible release builds (used by the CI workflows via
+# `pip install -r requirements.txt -c constraints.txt`). requirements.txt keeps
+# loose floors for running from source; this file freezes the exact tested set.
+# Bump deliberately when upgrading, not incidentally.
+PySide6==6.11.1
+requests==2.34.2
+urllib3==2.7.0
