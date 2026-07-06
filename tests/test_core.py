@@ -462,3 +462,46 @@ def test_load_queue_missing(tmp_path):
 def test_queue_from_dict_synthesizes_cover():
     s = c.queue_item_from_dict({"id": 77})
     assert s.cover_url.endswith("/beatmaps/77/covers/card@2x.jpg")
+
+
+# --------------------------------------------------------------------------
+# Optional official osu! API (client-credentials) -- mocked HTTP
+# --------------------------------------------------------------------------
+class _Resp:
+    def __init__(self, payload):
+        self._payload = payload
+    def raise_for_status(self):
+        pass
+    def json(self):
+        return self._payload
+
+
+def test_fetch_oauth_token(monkeypatch):
+    captured = {}
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        return _Resp({"access_token": "tok123", "expires_in": 86400})
+    monkeypatch.setattr(c.SESSION, "post", fake_post)
+    tok = c.fetch_oauth_token("15", "secret")
+    assert tok == "tok123"
+    assert captured["url"] == c.OAUTH_TOKEN_URL
+    assert captured["json"]["grant_type"] == "client_credentials"
+    assert captured["json"]["client_id"] == 15   # coerced to int
+
+
+def test_fetch_oauth_token_requires_credentials():
+    with pytest.raises(ValueError):
+        c.fetch_oauth_token("", "")
+
+
+def test_osu_api_beatmapset(monkeypatch):
+    def fake_get(url, headers=None, timeout=None):
+        assert headers["Authorization"] == "Bearer tok"
+        return _Resp({"id": 5, "title": "T", "artist": "A",
+                      "beatmaps": [{"mode": "osu", "difficulty_rating": 4.2,
+                                    "checksum": "d" * 32, "version": "X"}]})
+    monkeypatch.setattr(c.SESSION, "get", fake_get)
+    s = c.osu_api_beatmapset(5, "tok")
+    assert s.id == 5
+    assert s.diffs[0].checksum == "d" * 32     # checksums flow through for update checks
