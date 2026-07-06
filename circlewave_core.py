@@ -103,6 +103,12 @@ OSU_DIRECT_SET = "https://osu.direct/api/v2/s/{id}"
 PREVIEW_URL = "https://b.ppy.sh/preview/{id}.mp3"
 WEB_SET_URL = "https://osu.ppy.sh/beatmapsets/{id}"
 
+# Optional official osu! API v2 (client-credentials grant = app/"guest" token, no
+# user login). Enables higher rate limits, authoritative per-diff checksums (used
+# for map-update detection) and clean search. Off unless the user sets credentials.
+OAUTH_TOKEN_URL = "https://osu.ppy.sh/oauth/token"
+OSU_API_BASE = "https://osu.ppy.sh/api/v2"
+
 # Beatmap-pack medal data. The medal->pack mapping lives in the osu! wiki (mirrored
 # on GitHub raw, which isn't bot-gated); pack contents come from the public pack page.
 MEDAL_WIKI_URL = ("https://raw.githubusercontent.com/ppy/osu-wiki/master/"
@@ -1071,6 +1077,39 @@ def load_queue(path: Path) -> list:
         log.warning("could not read download queue %s: %s", path, e)
         return []
     return [queue_item_from_dict(d) for d in data if isinstance(d, dict) and d.get("id")]
+
+
+# ----------------------------------------------------------------------------
+# OPTIONAL OFFICIAL osu! API (client-credentials)
+# ----------------------------------------------------------------------------
+def fetch_oauth_token(client_id: str, client_secret: str) -> str:
+    """Get an app access token via the client-credentials grant (public scope).
+    Raises on failure (bad credentials, network). No user login involved."""
+    if not client_id or not client_secret:
+        raise ValueError("client id and secret are required")
+    r = SESSION.post(
+        OAUTH_TOKEN_URL,
+        json={"client_id": int(client_id), "client_secret": client_secret,
+              "grant_type": "client_credentials", "scope": "public"},
+        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+        timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    tok = r.json().get("access_token")
+    if not tok:
+        raise RuntimeError("no access_token in response")
+    return tok
+
+
+def osu_api_beatmapset(set_id: int, token: str) -> "Beatmapset":
+    """Fetch a set from the official API v2 (carries per-diff checksums, so it's
+    the authoritative source for update detection)."""
+    r = SESSION.get(
+        f"{OSU_API_BASE}/beatmapsets/{set_id}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json",
+                 "User-Agent": USER_AGENT},
+        timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return Beatmapset.from_json(r.json())
 
 
 _MEDAL_ROW_RE = re.compile(r"^\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*$")

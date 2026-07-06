@@ -69,14 +69,18 @@ from PySide6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, Signal, Slot, QSize, QUrl, QRect,
     QPoint, QTimer, QSettings,
 )
-from PySide6.QtGui import QPixmap, QDesktopServices, QFont, QFontMetrics, QIcon, QColor
+from PySide6.QtGui import (
+    QPixmap, QDesktopServices, QFont, QFontMetrics, QIcon, QColor,
+    QShortcut, QKeySequence, QAction,
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit,
     QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QHBoxLayout, QVBoxLayout,
     QGridLayout, QFormLayout, QScrollArea, QFrame, QSizePolicy, QLayout,
     QToolButton, QProgressBar, QDialog, QDialogButtonBox, QFileDialog,
     QMessageBox, QSplitter, QStatusBar, QStyle, QSlider, QGraphicsDropShadowEffect,
-    QListWidget, QListWidgetItem,
+    QListWidget, QListWidgetItem, QInputDialog, QAbstractItemView, QMenu,
+    QSystemTrayIcon,
 )
 
 # QtMultimedia is optional (preview audio). Degrade gracefully if codecs missing.
@@ -392,6 +396,7 @@ class BeatmapCard(QFrame):
 
     previewRequested = Signal(int)
     downloadRequested = Signal(object)
+    detailsRequested = Signal(object)
 
     def __init__(self, s: Beatmapset, downloaded: bool):
         super().__init__()
@@ -480,6 +485,13 @@ class BeatmapCard(QFrame):
         self.dl_btn.setObjectName("dlbtn")
         self.dl_btn.clicked.connect(lambda: self.downloadRequested.emit(self.s))
         btns.addWidget(self.dl_btn, 1)
+
+        self.info_btn = QToolButton()
+        self.info_btn.setText("\u24d8")            # circled i
+        self.info_btn.setToolTip("Details \u2014 all difficulties, more by this mapper/artist")
+        self.info_btn.setObjectName("circbtn")
+        self.info_btn.clicked.connect(lambda: self.detailsRequested.emit(self.s))
+        btns.addWidget(self.info_btn)
 
         web_btn = QToolButton()
         web_btn.setText("\u2197")
@@ -1214,6 +1226,29 @@ class SettingsDialog(QDialog):
         self.auto_open.setChecked(settings.value("auto_open", "false") == "true")
         form.addRow("", self.auto_open)
 
+        # Accent colour (theme). Restart-free: applied immediately on save.
+        self.accent = QComboBox()
+        for label, val in ACCENTS:
+            self.accent.addItem(label, val)
+        cur_accent = settings.value("accent", "synthwave")
+        self.accent.setCurrentIndex(max(0, self.accent.findData(cur_accent)))
+        form.addRow("Accent theme", self.accent)
+
+        # Optional osu! API credentials (client-credentials grant): enables higher
+        # rate limits + authoritative data and the "check for map updates" feature.
+        self.client_id = QLineEdit(settings.value("client_id", ""))
+        self.client_id.setPlaceholderText("optional — from osu.ppy.sh/home/account/edit → OAuth")
+        form.addRow("osu! API client ID", self.client_id)
+        self.client_secret = QLineEdit(settings.value("client_secret", ""))
+        self.client_secret.setEchoMode(QLineEdit.Password)
+        self.client_secret.setPlaceholderText("optional — client secret")
+        cs_row = QHBoxLayout()
+        cs_row.addWidget(self.client_secret, 1)
+        test_btn = QPushButton("Test")
+        test_btn.clicked.connect(self._test_api)
+        cs_row.addWidget(test_btn)
+        form.addRow("osu! API client secret", self._wrap(cs_row))
+
         hint = QLabel("Maps download into the Songs folder, which is also scanned to mark what "
                       "you already have (auto-detects osu-wine / lazer / Windows / macOS).\n\n"
                       "collection.db is your osu!stable collection file (usually in the osu! root, "
@@ -1266,12 +1301,275 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "Auto-detect",
                 "No osu! Songs folder found in common locations. Pick it manually.")
 
+    def _test_api(self):
+        cid = self.client_id.text().strip()
+        secret = self.client_secret.text().strip()
+        if not cid or not secret:
+            QMessageBox.information(self, "osu! API",
+                                    "Enter both a client ID and secret first.")
+            return
+        try:
+            fetch_oauth_token(cid, secret)
+        except Exception as e:  # noqa: BLE001
+            log.info("osu! API test failed: %s", e)
+            QMessageBox.warning(self, "osu! API",
+                                f"Couldn't authenticate:\n{type(e).__name__}: {e}")
+            return
+        QMessageBox.information(self, "osu! API",
+                                "Success — credentials work. Update checks are enabled.")
+
     def _save(self):
         self.settings.setValue("songs_dir", self.songs_dir.text().strip())
         self.settings.setValue("collection_db", self.collection_db.text().strip())
         self.settings.setValue("concurrency", self.concurrency.value())
         self.settings.setValue("auto_open", "true" if self.auto_open.isChecked() else "false")
+        self.settings.setValue("accent", self.accent.currentData())
+        self.settings.setValue("client_id", self.client_id.text().strip())
+        self.settings.setValue("client_secret", self.client_secret.text().strip())
         self.accept()
+
+
+# ----------------------------------------------------------------------------
+# COLLECTION MANAGER
+# ----------------------------------------------------------------------------
+class CollectionManagerDialog(QDialog):
+    """View and edit the collections inside osu!stable's collection.db:
+    rename, delete, or merge several into one. Every action backs up first."""
+
+    def __init__(self, db_path: Path, songs_dir: str, parent=None):
+        super().__init__(parent)
+        self.db_path = Path(db_path)
+        self.setWindowTitle("Collection manager")
+        self.resize(460, 560)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(10)
+
+        self.head = QLabel("")
+        self.head.setObjectName("packlabel")
+        self.head.setWordWrap(True)
+        lay.addWidget(self.head)
+
+        stats = library_stats(songs_dir)
+        self.stats_label = QLabel(
+            f"Library: {stats['count']} beatmapsets · "
+            f"{fmt_size(stats['osz_bytes'])} of .osz in the download folder")
+        self.stats_label.setObjectName("dockempty")
+        lay.addWidget(self.stats_label)
+
+        self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        lay.addWidget(self.list, 1)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+        for text, slot in [("Rename", self._rename), ("Delete", self._delete),
+                           ("Merge selected", self._merge)]:
+            b = QPushButton(text)
+            b.setObjectName("smallbtn")
+            b.clicked.connect(slot)
+            btns.addWidget(b)
+        btns.addStretch(1)
+        close = QPushButton("Close")
+        close.setObjectName("smallbtn")
+        close.clicked.connect(self.accept)
+        btns.addWidget(close)
+        lay.addLayout(btns)
+
+        note = QLabel("Close osu! before editing, then reopen (press F5 in song "
+                      "select if a change doesn't show). A .bak backup is kept.")
+        note.setObjectName("dockempty")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+
+        self._reload()
+
+    def _reload(self):
+        self.list.clear()
+        if not self.db_path.exists():
+            self.head.setText(f"No collection.db found at {self.db_path}. "
+                              "Build one via a pack, or set the path in Settings.")
+            return
+        cols = list_collections(self.db_path)
+        self.head.setText(f"{len(cols)} collection(s) in {self.db_path}")
+        for name, count in cols:
+            item = QListWidgetItem(f"{name}   —   {count} maps")
+            item.setData(Qt.UserRole, name)
+            self.list.addItem(item)
+
+    def _selected_names(self):
+        return [i.data(Qt.UserRole) for i in self.list.selectedItems()]
+
+    def _guard(self):
+        if not self.db_path.exists():
+            QMessageBox.information(self, "No collection.db",
+                                    "There's no collection.db to edit yet.")
+            return False
+        return True
+
+    def _rename(self):
+        if not self._guard():
+            return
+        names = self._selected_names()
+        if len(names) != 1:
+            QMessageBox.information(self, "Rename", "Select exactly one collection to rename.")
+            return
+        old = names[0]
+        new, ok = QInputDialog.getText(self, "Rename collection", "New name:", text=old)
+        new = (new or "").strip()
+        if not ok or not new or new == old:
+            return
+        try:
+            rename_collection(self.db_path, old, new)
+        except Exception as e:  # noqa: BLE001
+            log.exception("rename collection failed")
+            QMessageBox.critical(self, "Error", f"Couldn't rename:\n{e}")
+        self._reload()
+
+    def _delete(self):
+        if not self._guard():
+            return
+        names = self._selected_names()
+        if not names:
+            QMessageBox.information(self, "Delete", "Select one or more collections to delete.")
+            return
+        if QMessageBox.question(
+                self, "Delete collections?",
+                "Delete these collections?\n\n• " + "\n• ".join(names)
+                + "\n\nThe maps stay on disk; only the collections are removed.",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel) != QMessageBox.Yes:
+            return
+        try:
+            for n in names:
+                delete_collection(self.db_path, n)
+        except Exception as e:  # noqa: BLE001
+            log.exception("delete collection failed")
+            QMessageBox.critical(self, "Error", f"Couldn't delete:\n{e}")
+        self._reload()
+
+    def _merge(self):
+        if not self._guard():
+            return
+        names = self._selected_names()
+        if len(names) < 2:
+            QMessageBox.information(self, "Merge",
+                                    "Select two or more collections to merge (Ctrl/Shift-click).")
+            return
+        target, ok = QInputDialog.getText(
+            self, "Merge collections", "Name for the merged collection:", text=names[0])
+        target = (target or "").strip()
+        if not ok or not target:
+            return
+        try:
+            count = merge_collections(self.db_path, names, into=target)
+        except Exception as e:  # noqa: BLE001
+            log.exception("merge collections failed")
+            QMessageBox.critical(self, "Error", f"Couldn't merge:\n{e}")
+            return
+        QMessageBox.information(self, "Merged",
+                                f"“{target}” now has {count} maps.")
+        self._reload()
+
+
+# ----------------------------------------------------------------------------
+# BEATMAP DETAIL PANEL
+# ----------------------------------------------------------------------------
+class DetailDialog(QDialog):
+    """Expanded view of one beatmapset: every difficulty and quick actions,
+    including scoped searches for more maps by the same mapper or artist."""
+    downloadRequested = Signal(object)
+    searchRequested = Signal(str, str)      # option ("creator"/"artist"), text
+
+    def __init__(self, s: Beatmapset, owned: bool, parent=None):
+        super().__init__(parent)
+        self.s = s
+        self.setWindowTitle(f"{s.artist} - {s.title}" if s.artist else s.title)
+        self.resize(560, 520)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 16)
+        lay.setSpacing(10)
+
+        title = QLabel(f"<b style='font-size:17px'>{_esc(s.title)}</b>")
+        title.setWordWrap(True)
+        lay.addWidget(title)
+        artist = QLabel(_esc(s.artist))
+        artist.setObjectName("meta")
+        lay.addWidget(artist)
+
+        meta_bits = []
+        if s.creator:
+            meta_bits.append(f"mapped by {_esc(s.creator)}")
+        if s.status:
+            meta_bits.append(s.status)
+        if s.bpm:
+            meta_bits.append(f"{int(s.bpm)} BPM")
+        if s.play_count or s.favourite_count:
+            meta_bits.append(f"▶ {fmt_count(s.play_count)}   ♥ {fmt_count(s.favourite_count)}")
+        sub = QLabel("   ·   ".join(meta_bits))
+        sub.setObjectName("sub")
+        sub.setWordWrap(True)
+        lay.addWidget(sub)
+        if owned:
+            own = QLabel("✓ In your library")
+            own.setStyleSheet("color:#7ac74f; font-weight:700;")
+            lay.addWidget(own)
+
+        diff_head = QLabel(f"Difficulties ({len(s.diffs)})")
+        diff_head.setObjectName("panelhead")
+        lay.addWidget(diff_head)
+        self.diffs = QListWidget()
+        lay.addWidget(self.diffs, 1)
+        if s.diffs:
+            for d in sorted(s.diffs, key=lambda d: d.sr):
+                mode = MODE_NAME.get(d.mode, d.mode)
+                length = f"  ·  {fmt_len(d.length)}" if d.length else ""
+                self.diffs.addItem(f"★ {d.sr:.2f}   [{mode}]  {d.version}{length}")
+        else:
+            self.diffs.addItem("No per-difficulty data for this set.")
+
+        # actions
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+        self.dl_btn = QPushButton("Download")
+        self.dl_btn.setObjectName("primary")
+        self.dl_btn.clicked.connect(self._download)
+        btns.addWidget(self.dl_btn)
+        if s.creator:
+            b = QPushButton("More by mapper")
+            b.setObjectName("smallbtn")
+            b.clicked.connect(lambda: self._search("creator", s.creator))
+            btns.addWidget(b)
+        if s.artist:
+            b = QPushButton("More by artist")
+            b.setObjectName("smallbtn")
+            b.clicked.connect(lambda: self._search("artist", s.artist))
+            btns.addWidget(b)
+        web = QPushButton("Open on osu!")
+        web.setObjectName("smallbtn")
+        web.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(WEB_SET_URL.format(id=s.id))))
+        btns.addWidget(web)
+        btns.addStretch(1)
+        close = QPushButton("Close")
+        close.setObjectName("smallbtn")
+        close.clicked.connect(self.accept)
+        btns.addWidget(close)
+        lay.addLayout(btns)
+
+    def _download(self):
+        self.downloadRequested.emit(self.s)
+        self.dl_btn.setText("Queued ✓")
+        self.dl_btn.setEnabled(False)
+
+    def _search(self, option, text):
+        self.searchRequested.emit(option, text)
+        self.accept()
+
+
+def _esc(text: str) -> str:
+    """Minimal HTML escape for rich-text labels."""
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ----------------------------------------------------------------------------
@@ -1311,6 +1609,7 @@ class MainWindow(QMainWindow):
         self.dl_rows = {}          # setid -> DownloadRow
         self.dl_workers = {}       # setid -> active DownloadWorker
         self.dl_pending = []       # list[Beatmapset] waiting for a free slot
+        self.dl_failed = {}        # setid -> Beatmapset for failed (retryable) items
         self.dl_paused = False
         self.dl_concurrency = int(self.settings.value("concurrency", 3))
         self.downloaded_ids = set()
@@ -1318,12 +1617,15 @@ class MainWindow(QMainWindow):
         self.pack = None           # active medal-pack session, or None
 
         # persistent download history (also marks lazer imports / other machines)
-        self.history_path = Path(self.settings.fileName()).parent / "download_history.json"
+        cfg_dir = Path(self.settings.fileName()).parent
+        self.history_path = cfg_dir / "download_history.json"
         self.history_ids = load_history(self.history_path)
+        self.queue_path = cfg_dir / "download_queue.json"
 
         self._build_ui()
         self._setup_audio()
         self._refresh_downloaded()
+        self._restore_queue()
         QTimer.singleShot(0, self.new_search)  # initial A-Z-ish load
 
     # -- UI -----------------------------------------------------------------
@@ -1405,6 +1707,12 @@ class MainWindow(QMainWindow):
         self.cancel_all_btn.clicked.connect(self.cancel_all)
         head.addWidget(self.cancel_all_btn)
         head.addStretch(1)
+        self.retry_btn = QPushButton("Retry failed")
+        self.retry_btn.setObjectName("dockbtn")
+        self.retry_btn.setToolTip("Re-queue every download that failed")
+        self.retry_btn.clicked.connect(self.retry_failed)
+        self.retry_btn.setEnabled(False)
+        head.addWidget(self.retry_btn)
         clear = QPushButton("Clear finished")
         clear.setObjectName("dockbtn")
         clear.clicked.connect(self._clear_finished)
@@ -1456,12 +1764,17 @@ class MainWindow(QMainWindow):
             self.vol_slider.setToolTip("Preview volume")
             self.vol_slider.valueChanged.connect(self._set_volume)
             self.status.addPermanentWidget(self.vol_slider)
+        collections_btn = QPushButton("\U0001F5C2 Collections")
+        collections_btn.setObjectName("smallbtn")
+        collections_btn.setToolTip("View, rename, delete or merge your osu! collections")
+        collections_btn.clicked.connect(self._open_collections)
+        self.status.addPermanentWidget(collections_btn)
         settings_btn = QPushButton("\u2699 Settings")
         settings_btn.setObjectName("smallbtn")
         settings_btn.clicked.connect(self._open_settings)
         self.status.addPermanentWidget(settings_btn)
 
-        self.setStyleSheet(STYLE)
+        self.setStyleSheet(themed_style(self.settings.value("accent", "synthwave")))
 
     def _setup_audio(self):
         self.player = None
@@ -1493,6 +1806,7 @@ class MainWindow(QMainWindow):
         card = BeatmapCard(s, owned)
         card.previewRequested.connect(self.preview)
         card.downloadRequested.connect(self.enqueue_download)
+        card.detailsRequested.connect(self._open_details)
         self.flow.addWidget(card)
         self.cards[s.id] = card
         # Covers are loaded lazily for cards near the viewport (see
@@ -1902,6 +2216,7 @@ class MainWindow(QMainWindow):
         old = self.dl_rows.pop(s.id, None)
         if old is not None:
             old.deleteLater()
+        self.dl_failed.pop(s.id, None)
 
         row = DownloadRow(s)
         row.cancelRequested.connect(self.cancel_download)
@@ -1911,7 +2226,48 @@ class MainWindow(QMainWindow):
         if s.id in self.cards:
             self.cards[s.id].mark_queued()
         self._update_dock_empty()
+        self._update_retry_btn()
+        self._persist_queue()
         self._pump()
+
+    def retry_failed(self):
+        """Re-queue every download that failed (not the ones you cancelled)."""
+        failed = list(self.dl_failed.values())
+        self.dl_failed.clear()
+        for s in failed:
+            self.enqueue_download(s)
+        self._update_retry_btn()
+
+    def _update_retry_btn(self):
+        if hasattr(self, "retry_btn"):
+            self.retry_btn.setEnabled(bool(self.dl_failed))
+
+    # -- queue persistence --------------------------------------------------
+    def _persist_queue(self):
+        """Save everything not yet finished (pending + in-flight) so a batch can
+        be resumed after a restart; the .part files let it pick up mid-file."""
+        active = [w.s for w in self.dl_workers.values()]
+        save_queue(self.queue_path, active + list(self.dl_pending))
+
+    def _restore_queue(self):
+        sets = load_queue(self.queue_path)
+        if not sets:
+            return
+        # Restore rows but start paused, so nothing downloads unprompted on launch.
+        self.dl_paused = True
+        for s in sets:
+            if s.id in self.downloaded_ids:
+                continue
+            row = DownloadRow(s)
+            row.cancelRequested.connect(self.cancel_download)
+            self.dl_layout.insertWidget(self.dl_layout.count() - 1, row)
+            self.dl_rows[s.id] = row
+            self.dl_pending.append(s)
+        if self.dl_pending:
+            self.pause_btn.setText("Resume")
+            self._update_dock_empty()
+            self.status_label.setText(
+                f"Restored {len(self.dl_pending)} queued download(s) — press Resume to continue.")
 
     def _update_dock_empty(self):
         self.dl_empty.setVisible(not self.dl_rows)
@@ -1951,6 +2307,7 @@ class MainWindow(QMainWindow):
 
     def cancel_download(self, setid: int):
         self.dl_pending = [p for p in self.dl_pending if p.id != setid]
+        self.dl_failed.pop(setid, None)
         worker = self.dl_workers.get(setid)
         if worker:                       # in-flight: ask it to stop (emits failed "cancelled")
             worker.cancel()
@@ -1961,10 +2318,13 @@ class MainWindow(QMainWindow):
             if setid in self.cards:
                 self.cards[setid].set_downloaded(setid in self.downloaded_ids)
             self._pump()
+        self._update_retry_btn()
+        self._persist_queue()
 
     def cancel_all(self):
         pending = self.dl_pending
         self.dl_pending = []
+        self.dl_failed.clear()
         for s in pending:
             row = self.dl_rows.get(s.id)
             if row:
@@ -1973,6 +2333,8 @@ class MainWindow(QMainWindow):
                 self.cards[s.id].set_downloaded(s.id in self.downloaded_ids)
         for worker in list(self.dl_workers.values()):
             worker.cancel()
+        self._update_retry_btn()
+        self._persist_queue()
 
     @Slot(int, int, str)
     def _on_dl_progress(self, setid, pct, status):
@@ -1995,11 +2357,13 @@ class MainWindow(QMainWindow):
         if self.settings.value("auto_open", "false") == "true":
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
         self._pack_map_finished(setid, path)
+        self._persist_queue()
         self._pump()
 
     @Slot(int, str)
     def _on_dl_failed(self, setid, err):
         row = self.dl_rows.get(setid)
+        worker = self.dl_workers.get(setid)
         if err == "cancelled":
             if row:
                 row.set_cancelled()
@@ -2010,7 +2374,10 @@ class MainWindow(QMainWindow):
                 row.set_failed(err)
             if setid in self.cards:
                 self.cards[setid].mark_failed()
+            if worker is not None:            # remember it so "Retry failed" can re-queue
+                self.dl_failed[setid] = worker.s
         self.dl_workers.pop(setid, None)
+        self._update_retry_btn()
         # a pack map that won't arrive shouldn't stall the collection build
         if err == "cancelled" and self.pack and self.pack.get("collecting"):
             # cancelling the queue aborts the whole collection build
@@ -2019,6 +2386,7 @@ class MainWindow(QMainWindow):
             self.pack_dl_btn.setEnabled(True)
         else:
             self._pack_map_finished(setid, None)
+        self._persist_queue()
         self._pump()
 
     def _clear_finished(self):
@@ -2038,9 +2406,33 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self.dl_concurrency = int(self.settings.value("concurrency", 3))
             self.dl_pool.setMaxThreadCount(self.dl_concurrency)
+            self.setStyleSheet(themed_style(self.settings.value("accent", "synthwave")))
             self._refresh_downloaded()
             self.new_search()
             self._pump()
+
+    def _open_collections(self):
+        db_path = self._collection_db_path(prompt=False)
+        CollectionManagerDialog(db_path, self.settings.value("songs_dir", ""), self).exec()
+        self._refresh_downloaded()
+
+    def _open_details(self, s: Beatmapset):
+        dlg = DetailDialog(s, s.id in self.downloaded_ids, self)
+        dlg.downloadRequested.connect(self.enqueue_download)
+        dlg.searchRequested.connect(self._search_field)
+        dlg.exec()
+
+    def _search_field(self, option: str, text: str):
+        """Run a scoped search (e.g. all maps by a mapper/artist) from a detail panel."""
+        fb = self.filter_bar
+        fb.query.setText(text)
+        for combo, data in ((fb.search_in, option), (fb.status, "all")):
+            idx = combo.findData(data)
+            if idx >= 0:
+                combo.blockSignals(True)      # avoid firing a search per change
+                combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
+        self.new_search()
 
 
 # ----------------------------------------------------------------------------
@@ -2222,6 +2614,34 @@ QSlider::handle:horizontal {
     background: #ffffff; width: 12px; height: 12px; margin: -5px 0; border-radius: 6px;
 }
 """
+
+# Accent themes. Each swaps the two signature accents (primary "pink" #ff66ab and
+# secondary "cyan" #36e0ff) throughout the stylesheet; the deep-indigo base and the
+# status colours stay put. "synthwave" is the original look.
+ACCENTS = [
+    ("Synthwave (pink · cyan)", "synthwave"),
+    ("Sunset (coral · gold)", "sunset"),
+    ("Vaporwave (violet · aqua)", "vapor"),
+    ("Matrix (green · mint)", "matrix"),
+    ("Ice (blue · sky)", "ice"),
+]
+ACCENT_COLORS = {
+    "synthwave": ("#ff66ab", "#36e0ff"),
+    "sunset":    ("#ff7a59", "#ffd166"),
+    "vapor":     ("#c774e8", "#41ead4"),
+    "matrix":    ("#39ff14", "#9dffce"),
+    "ice":       ("#5b9dff", "#8ee3ff"),
+}
+PRIMARY_ACCENT = "#ff66ab"
+SECONDARY_ACCENT = "#36e0ff"
+
+
+def themed_style(accent_key: str) -> str:
+    """The stylesheet recoloured for the chosen accent (falls back to synthwave)."""
+    pink, cyan = ACCENT_COLORS.get(accent_key, ACCENT_COLORS["synthwave"])
+    if (pink, cyan) == (PRIMARY_ACCENT, SECONDARY_ACCENT):
+        return STYLE
+    return STYLE.replace(PRIMARY_ACCENT, pink).replace(SECONDARY_ACCENT, cyan)
 
 
 def resource_path(name: str) -> str:
