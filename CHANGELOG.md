@@ -4,6 +4,53 @@ All notable changes to CircleWave are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-07-06
+
+### Added
+- **Collection manager** (🗂) — view, rename, delete and merge the collections in
+  your `collection.db`, with a library summary. Every edit backs up first.
+- **Beatmap detail panel** (ⓘ on a card) — every difficulty at a glance, plus
+  one-click **More by mapper** / **More by artist** scoped searches.
+- **Persistent download queue** — a batch survives a restart: pending and
+  in-flight items are saved and restored (paused), resuming via their `.part`
+  files. New **Retry failed** button re-queues everything that errored.
+- **Filter presets** (★) — save the current filter set under a name and re-apply
+  it in one click.
+- **Random / surprise me** (🎲) and **search-box history** (autocomplete of recent
+  queries).
+- **Check for updates** (⟳) — scans your downloaded `.osz` files against
+  authoritative per-diff checksums and offers to re-download any with a newer
+  version online.
+- **16 full-UI themes** — Settings offers a real theme picker (Synthwave, Matrix,
+  Ember, Dracula, Aurora, Carbon, Bubblegum…). Each recolours the *entire* UI —
+  backgrounds, surfaces, borders, text and both accents — derived from seed
+  colours, not just the two highlight colours.
+- **System tray** icon + a notification when the queue finishes; **keyboard
+  shortcuts** (Ctrl+F, F5, Ctrl+R, Ctrl+D, Ctrl+Shift+C, Ctrl+,, Esc);
+  **live download speed + ETA**; and the app now **reopens with your last filters**.
+- **Optional official osu! API** — set OAuth client credentials in Settings
+  (client-credentials grant, no user login) for higher rate limits and
+  authoritative data used by the update check.
+- **Collection write preview** — before a `collection.db` is created or modified,
+  a confirmation dialog shows how many maps go in, whether a same-named collection
+  is being replaced, which others are kept, and where the file lands.
+- **Resumable downloads** — an interrupted or cancelled `.osz` keeps its partial
+  file and resumes via HTTP Range (from the same mirror), instead of restarting.
+- **pip / pipx install** — `pyproject.toml` exposes a `circlewave` console script.
+- **Linux release binary** built in CI (PyInstaller), attached to tagged releases.
+
+### Changed
+- **More reliable networking** — all requests share one pooled session with
+  automatic retry/backoff on rate-limits and 5xx; the osu.ppy.sh scraping paths
+  are politely throttled. Finished downloads are validated as real zips.
+- **lazer collections** — clarified that CircleWave's stable `collection.db` can be
+  imported into lazer via its Setup Wizard's Import step.
+
+### Internal
+- Split the Qt-free logic into `circlewave_core.py` with a `pytest` suite (74 tests);
+  builds now run the tests before packaging. Swallowed errors are now logged
+  (tunable via `CIRCLEWAVE_LOG`).
+
 ## [1.2.1] - 2026-06-23
 
 ### Changed
@@ -77,6 +124,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - "Already in library" detection and hide-owned, driven by your osu! Songs folder.
 - GPL-3.0 licensed; Windows `.exe` built via GitHub Actions.
 
+[2.3.0]: https://github.com/AmarilloNL/CircleWave/releases/tag/v2.3.0
 [1.2.1]: https://github.com/AmarilloNL/CircleWave/releases/tag/v1.2.1
 [1.2.0]: https://github.com/AmarilloNL/CircleWave/releases/tag/v1.2.0
 [1.1.0]: https://github.com/AmarilloNL/CircleWave/releases/tag/v1.1.0

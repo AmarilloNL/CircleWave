@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Linux binary
 
 # Build manually from the Actions tab, or automatically when you push a vX.Y.Z tag.
 on:
@@ -7,14 +7,13 @@ on:
     tags:
       - 'v*'
 
-# Lets the workflow's GITHUB_TOKEN create the GitHub Release (otherwise it's
-# read-only and "Attach to release" fails with a 403 "Resource not accessible").
+# Lets the workflow's GITHUB_TOKEN create/attach the GitHub Release.
 permissions:
   contents: write
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -32,20 +31,27 @@ jobs:
           pip install pytest
           python -m pytest -q
 
-      - name: Build executable
+      - name: Build binary
+        # Reuses circlewave.spec; PyInstaller follows the import into
+        # circlewave_core.py automatically. Produces dist/CircleWave.
         run: pyinstaller circlewave.spec
+
+      - name: Package
+        run: |
+          cd dist
+          chmod +x CircleWave
+          tar czf CircleWave-linux-x86_64.tar.gz CircleWave
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CircleWave-windows
-          path: dist/CircleWave.exe
+          name: CircleWave-linux
+          path: dist/CircleWave-linux-x86_64.tar.gz
 
-      # When triggered by a version tag, also publish a GitHub Release with the exe attached.
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/CircleWave.exe
+          files: dist/CircleWave-linux-x86_64.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -48,9 +48,16 @@ two dependencies, so it's a couple of commands on any distro.
   (pulled live from the osu! wiki). Pick one and it loads the pack's maps (with real artist / title /
   mapper / stars), downloads them all through the queue, hashes the `.osu` files, and writes a
   collection named after the medal into a `collection.db` you choose. The path is set in Settings
-  (Browse / Auto-detect) or picked once and remembered; a `.bak` backup is written and existing
-  collections are merged, not overwritten. Close osu! before it finishes, then reopen. *Stable only —
-  lazer keeps collections in a Realm DB that can't be safely written from outside.*
+  (Browse / Auto-detect) or picked once and remembered. Before anything is written you get a
+  **confirmation preview** — how many maps go in, whether a same-named collection is being
+  replaced, which other collections are left untouched, and where the file lands. A `.bak` backup
+  is written and existing collections are merged, not overwritten. Close osu! before it finishes,
+  then reopen.
+  - **Using lazer?** CircleWave writes a standard osu!**stable** `collection.db` (it doesn't touch
+    lazer's Realm DB directly — that isn't safe to write from outside). lazer can still ingest it:
+    run lazer's **first-run Setup Wizard → Import**, point "previous osu! install" at the folder
+    holding the `collection.db` CircleWave wrote, and import — the collection comes across. Point
+    the Settings path at your stable install (or any folder) to produce a file to import.
 - **Beatmap packs** — the 📦 *Beatmap packs* button browses all ~3,750 official osu! packs across the
   seven categories (Standard, Featured Artist, Tournament, Project Loved, Spotlights, Theme,
   Artist/Album), with a game-mode filter and name search. Pick a pack and it loads exactly like a
@@ -64,7 +71,22 @@ two dependencies, so it's a couple of commands on any distro.
 - **Batch downloads** — queue manager with adjustable concurrency, per-item progress, mirror
   fallback, optional no-video, optional auto-open to import.
 - **Bulk + queue control** — "Download all shown" queues the visible results; Pause/Resume the
-  queue, Cancel all, or cancel an individual item (✕).
+  queue, Cancel all, or cancel an individual item (✕). The queue **survives a restart** (it
+  resumes from partial `.part` files), shows **live speed + ETA**, and has a **Retry failed** button.
+- **Collection manager** (🗂) — view, rename, delete and merge the collections in your
+  `collection.db`; every edit backs up first. Works alongside the pack-based collection builder.
+- **Detail panel** (ⓘ) — expand any card for its full difficulty list and one-click **More by
+  mapper / artist** searches.
+- **Presets, random & history** — save filter sets under a name (★), jump to a random result (🎲),
+  and autocomplete recent searches. The app reopens with your last filters.
+- **Check for updates** (⟳) — flags downloaded `.osz` files that have a newer version online and
+  offers to re-download them.
+- **Themes & shortcuts** — 16 full-UI themes in Settings (Synthwave, Matrix, Ember, Dracula, Aurora,
+  Carbon, Bubblegum, …) that recolour the whole interface, not just the accents; a system-tray icon notifies you when
+  a batch finishes; keyboard shortcuts (Ctrl+F search, F5 refresh, Ctrl+R random, Ctrl+D
+  download-all, Ctrl+Shift+C collections, Ctrl+, settings, Esc stop preview).
+- **Optional osu! API** — add OAuth client credentials in Settings (no user login; client-credentials
+  grant) for higher rate limits and authoritative data behind the update check.
 
 ## Run from source
 
@@ -128,6 +150,22 @@ the pip PySide6 wheels are arm64-native.
 > **Note on audio preview:** on Linux, PySide6 plays through GStreamer, so the relevant plugin
 > packages must be present (they usually are on a desktop install). Windows and macOS use their
 > native backends and need nothing extra.
+
+### Install as a command (pipx)
+Once installed this way you get a `circlewave` launcher on your PATH:
+```bash
+pipx install .          # or: pip install .
+circlewave
+```
+
+### Development
+Core logic lives in `circlewave_core.py` (no Qt), so the test suite runs without a display:
+```bash
+pip install pytest
+pytest
+```
+Set `CIRCLEWAVE_LOG=DEBUG` when running the app to see mirror fallbacks, download
+retries and other diagnostics on stderr.
 
 ## Data source
 - **Search** uses the **Hinamizawa** mirror (`mirror.hinamizawa.ai`) — a complete, no-auth index
