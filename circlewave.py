@@ -57,19 +57,13 @@ from __future__ import annotations
 import os
 import re
 import sys
-import time
-import json
-import math
-import hashlib
 import logging
 import tempfile
 import threading
 import zipfile
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
-
-import requests
+# Config, data model, networking, collection.db and parsers live in
+# circlewave_core (see the star-import just below the Qt imports).
 
 from PySide6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, Signal, Slot, QSize, QUrl, QRect,
@@ -1759,8 +1753,32 @@ class MainWindow(QMainWindow):
                                 "No beatmap files were found to hash, so no collection "
                                 "was created. Check that the downloads succeeded.")
             return
+
+        # Dry-run: show exactly what will change before we touch collection.db.
+        name = pk["medal"]
+        prev = preview_collection_merge(db_path, name, hashes)
+        verb = "Replace" if prev["replacing"] else "Create"
+        lines = [f"{verb} collection “{name}” with {prev['new_maps']} maps."]
+        if prev["replacing"]:
+            lines.append(f"The existing “{name}” ({prev['old_maps']} maps) "
+                         "will be overwritten.")
+        if prev["kept"]:
+            lines.append(f"{len(prev['kept'])} other collection(s) "
+                         f"({sum(c for _, c in prev['kept'])} maps) will be kept.")
+        if prev["db_exists"]:
+            lines.append("A .bak backup of the current collection.db will be written first.")
+        else:
+            lines.append("A new collection.db will be created (osu! not detected here — "
+                         "check the path in Settings if this looks wrong).")
+        lines.append(f"\nFile: {db_path}")
+        confirm = QMessageBox.question(
+            self, "Write collection?", "\n".join(lines),
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
+        if confirm != QMessageBox.Yes:
+            return
+
         try:
-            status = upsert_collection(db_path, pk["medal"], hashes)
+            status = upsert_collection(db_path, name, hashes)
         except Exception as e:  # noqa: BLE001
             log.exception("collection write to %s failed", db_path)
             QMessageBox.critical(self, "Collection error",

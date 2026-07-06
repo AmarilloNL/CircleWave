@@ -48,9 +48,16 @@ two dependencies, so it's a couple of commands on any distro.
   (pulled live from the osu! wiki). Pick one and it loads the pack's maps (with real artist / title /
   mapper / stars), downloads them all through the queue, hashes the `.osu` files, and writes a
   collection named after the medal into a `collection.db` you choose. The path is set in Settings
-  (Browse / Auto-detect) or picked once and remembered; a `.bak` backup is written and existing
-  collections are merged, not overwritten. Close osu! before it finishes, then reopen. *Stable only —
-  lazer keeps collections in a Realm DB that can't be safely written from outside.*
+  (Browse / Auto-detect) or picked once and remembered. Before anything is written you get a
+  **confirmation preview** — how many maps go in, whether a same-named collection is being
+  replaced, which other collections are left untouched, and where the file lands. A `.bak` backup
+  is written and existing collections are merged, not overwritten. Close osu! before it finishes,
+  then reopen.
+  - **Using lazer?** CircleWave writes a standard osu!**stable** `collection.db` (it doesn't touch
+    lazer's Realm DB directly — that isn't safe to write from outside). lazer can still ingest it:
+    run lazer's **first-run Setup Wizard → Import**, point "previous osu! install" at the folder
+    holding the `collection.db` CircleWave wrote, and import — the collection comes across. Point
+    the Settings path at your stable install (or any folder) to produce a file to import.
 - **Beatmap packs** — the 📦 *Beatmap packs* button browses all ~3,750 official osu! packs across the
   seven categories (Standard, Featured Artist, Tournament, Project Loved, Spotlights, Theme,
   Artist/Album), with a game-mode filter and name search. Pick a pack and it loads exactly like a
@@ -128,6 +135,22 @@ the pip PySide6 wheels are arm64-native.
 > **Note on audio preview:** on Linux, PySide6 plays through GStreamer, so the relevant plugin
 > packages must be present (they usually are on a desktop install). Windows and macOS use their
 > native backends and need nothing extra.
+
+### Install as a command (pipx)
+Once installed this way you get a `circlewave` launcher on your PATH:
+```bash
+pipx install .          # or: pip install .
+circlewave
+```
+
+### Development
+Core logic lives in `circlewave_core.py` (no Qt), so the test suite runs without a display:
+```bash
+pip install pytest
+pytest
+```
+Set `CIRCLEWAVE_LOG=DEBUG` when running the app to see mirror fallbacks, download
+retries and other diagnostics on stderr.
 
 ## Data source
 - **Search** uses the **Hinamizawa** mirror (`mirror.hinamizawa.ai`) — a complete, no-auth index
