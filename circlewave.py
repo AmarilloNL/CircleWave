@@ -57,6 +57,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import random
 import logging
 import tempfile
 import threading
@@ -67,7 +68,7 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, Signal, Slot, QSize, QUrl, QRect,
-    QPoint, QTimer, QSettings,
+    QPoint, QTimer, QSettings, QStringListModel,
 )
 from PySide6.QtGui import (
     QPixmap, QDesktopServices, QFont, QFontMetrics, QIcon, QColor,
@@ -652,6 +653,7 @@ class FilterBar(QWidget):
     medalPacksRequested = Signal()
     beatmapPacksRequested = Signal()
     mostPlayedRequested = Signal()
+    randomRequested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -710,6 +712,21 @@ class FilterBar(QWidget):
         self.mostplayed_btn.setToolTip("Load a player's most-played beatmaps and grab them all")
         self.mostplayed_btn.clicked.connect(self.mostPlayedRequested.emit)
         row1.addWidget(self.mostplayed_btn)
+
+        self.random_btn = QToolButton()
+        self.random_btn.setText("\U0001F3B2")          # 🎲
+        self.random_btn.setObjectName("medalbtn")
+        self.random_btn.setToolTip("Surprise me — open a random map from the results")
+        self.random_btn.clicked.connect(self.randomRequested.emit)
+        row1.addWidget(self.random_btn)
+
+        # Presets: a popup menu, populated by MainWindow, to save/apply filter sets.
+        self.presets_btn = QToolButton()
+        self.presets_btn.setText("★")             # ★
+        self.presets_btn.setObjectName("medalbtn")
+        self.presets_btn.setToolTip("Saved filter presets")
+        self.presets_btn.setPopupMode(QToolButton.InstantPopup)
+        row1.addWidget(self.presets_btn)
         outer.addLayout(row1)
 
         # filters live in a distinct surface panel so they read as real controls
@@ -825,6 +842,44 @@ class FilterBar(QWidget):
             "hide_owned": self.hide_owned.isChecked(),
             "no_video": self.no_video.isChecked(),
         }
+
+    def set_filters(self, f: dict):
+        """Apply a saved preset to the controls (reverse of filters()). Signals are
+        blocked so the caller triggers exactly one search afterwards."""
+        widgets = [self.query, self.mode, self.status, self.sort, self.bpm,
+                   self.length, self.stars, self.genre, self.language,
+                   self.search_in, self.hide_owned, self.no_video]
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            self.query.setText(f.get("q", "") or "")
+            self._pick(self.mode, f.get("mode"))
+            self._pick(self.status, f.get("status", "all"))
+            self._pick(self.sort, f.get("sort", "ranked_desc"))
+            self._pick(self.search_in, f.get("option", ""))
+            self._pick(self.genre, f.get("genre", 0))
+            self._pick(self.language, f.get("language", 0))
+            self._pick_range(self.bpm, f.get("bpm_min", 0), f.get("bpm_max", 0))
+            self._pick_range(self.stars, f.get("sr_min", 0), f.get("sr_max", 0))
+            self._pick_range(self.length, f.get("len_min", 0), f.get("len_max", 0))
+            self.hide_owned.setChecked(bool(f.get("hide_owned")))
+            self.no_video.setChecked(bool(f.get("no_video")))
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+
+    @staticmethod
+    def _pick(combo, data):
+        idx = combo.findData(data)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+    @staticmethod
+    def _pick_range(combo, lo, hi):
+        for i in range(combo.count()):
+            if combo.itemData(i) == (lo, hi):
+                combo.setCurrentIndex(i)
+                return
+        combo.setCurrentIndex(0)      # custom/unknown range -> "Any"
 
 
 # ----------------------------------------------------------------------------
@@ -1641,7 +1696,10 @@ class MainWindow(QMainWindow):
         self.filter_bar.medalPacksRequested.connect(self._open_medal_packs)
         self.filter_bar.beatmapPacksRequested.connect(self._open_beatmap_packs)
         self.filter_bar.mostPlayedRequested.connect(self._open_most_played)
+        self.filter_bar.randomRequested.connect(self._open_random)
         root.addWidget(self.filter_bar)
+        self._setup_search_history()
+        self._rebuild_presets_menu()
 
         rule = QFrame()
         rule.setObjectName("neonrule")
@@ -1819,6 +1877,7 @@ class MainWindow(QMainWindow):
         if self.pack:
             self._exit_pack_mode(refresh=False)
         self.cur_filters = self.filter_bar.filters()
+        self._push_history(self.cur_filters.get("q", ""))
         self.cursor_token = None
         self.more = True
         self.auto_pages = 0
@@ -2433,6 +2492,91 @@ class MainWindow(QMainWindow):
                 combo.setCurrentIndex(idx)
                 combo.blockSignals(False)
         self.new_search()
+
+    # -- random / surprise me ----------------------------------------------
+    def _open_random(self):
+        """Open the detail panel for a random map among the current results."""
+        if not self.cards:
+            self.status_label.setText("Search something first, then hit 🎲.")
+            return
+        s = random.choice(list(self.cards.values())).s
+        self._open_details(s)
+
+    # -- search history -----------------------------------------------------
+    def _setup_search_history(self):
+        from PySide6.QtWidgets import QCompleter
+        self._history_model = QStringListModel(self._history_list())
+        completer = QCompleter(self._history_model, self)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        self.filter_bar.query.setCompleter(completer)
+
+    def _history_list(self):
+        return self.settings.value("search_history", []) or []
+
+    def _push_history(self, q: str):
+        q = (q or "").strip()
+        if not q:
+            return
+        hist = [h for h in self._history_list() if h.lower() != q.lower()]
+        hist.insert(0, q)
+        del hist[20:]                          # keep the 20 most recent
+        self.settings.setValue("search_history", hist)
+        if getattr(self, "_history_model", None) is not None:
+            self._history_model.setStringList(hist)
+
+    # -- filter presets -----------------------------------------------------
+    def _load_presets(self) -> dict:
+        raw = self.settings.value("filter_presets", "")
+        try:
+            return json.loads(raw) if raw else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _store_presets(self, presets: dict):
+        self.settings.setValue("filter_presets", json.dumps(presets))
+
+    def _rebuild_presets_menu(self):
+        menu = QMenu(self)
+        presets = self._load_presets()
+        for name in sorted(presets):
+            act = menu.addAction(name)
+            act.triggered.connect(lambda _=False, n=name: self._apply_preset(n))
+        if presets:
+            menu.addSeparator()
+        menu.addAction("Save current filters…", self._save_preset)
+        if presets:
+            menu.addAction("Delete a preset…", self._delete_preset)
+        self.filter_bar.presets_btn.setMenu(menu)
+
+    def _apply_preset(self, name: str):
+        presets = self._load_presets()
+        if name in presets:
+            self.filter_bar.set_filters(presets[name])
+            self.new_search()
+
+    def _save_preset(self):
+        name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        presets = self._load_presets()
+        presets[name] = self.filter_bar.filters()
+        self._store_presets(presets)
+        self._rebuild_presets_menu()
+        self.status_label.setText(f"Saved filter preset “{name}”.")
+
+    def _delete_preset(self):
+        presets = self._load_presets()
+        if not presets:
+            return
+        name, ok = QInputDialog.getItem(self, "Delete preset", "Preset:",
+                                        sorted(presets), 0, False)
+        if not ok or name not in presets:
+            return
+        del presets[name]
+        self._store_presets(presets)
+        self._rebuild_presets_menu()
 
 
 # ----------------------------------------------------------------------------
