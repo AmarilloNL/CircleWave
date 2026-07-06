@@ -81,7 +81,8 @@ two dependencies, so it's a couple of commands on any distro.
   and autocomplete recent searches. The app reopens with your last filters.
 - **Check for updates** (⟳) — flags downloaded `.osz` files that have a newer version online and
   offers to re-download them.
-- **Themes & shortcuts** — pick an accent palette in Settings; a system-tray icon notifies you when
+- **Themes & shortcuts** — 16 full-UI themes in Settings (Synthwave, Matrix, Ember, Dracula, Aurora,
+  Carbon, Bubblegum, …) that recolour the whole interface, not just the accents; a system-tray icon notifies you when
   a batch finishes; keyboard shortcuts (Ctrl+F search, F5 refresh, Ctrl+R random, Ctrl+D
   download-all, Ctrl+Shift+C collections, Ctrl+, settings, Esc stop preview).
 - **Optional osu! API** — add OAuth client credentials in Settings (no user login; client-credentials
