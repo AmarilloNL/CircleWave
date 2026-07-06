@@ -264,6 +264,7 @@ class Diff:
     bpm: float
     length: int
     version: str
+    checksum: str = ""      # per-diff .osu md5 (for update detection); "" if unknown
 
 
 @dataclass
@@ -320,6 +321,7 @@ class Beatmapset:
                 bpm=float(b.get("bpm", 0) or 0),
                 length=int(b.get("total_length", 0) or 0),
                 version=b.get("version", ""),
+                checksum=str(b.get("checksum", "") or ""),
             ))
         diffs.sort(key=lambda d: d.sr)
         return cls(
@@ -349,6 +351,7 @@ class Beatmapset:
                 bpm=0.0,
                 length=int(b.get("TotalLength", 0) or 0),
                 version=b.get("DiffName", ""),
+                checksum=str(b.get("FileMD5", "") or ""),
             ))
         diffs.sort(key=lambda d: d.sr)
         variant = "card" + "@2x.jpg"
@@ -813,10 +816,20 @@ def md5s_from_osz(osz_path) -> list:
     return hashes
 
 
-def upsert_collection(db_path: Path, name: str, hashes: list) -> str:
-    """Create/replace a named collection in collection.db (backing up first).
+def _dedup(hashes) -> list:
+    """Drop empties and duplicates, preserving first-seen order."""
+    seen, out = set(), []
+    for h in hashes:
+        if h and h not in seen:
+            seen.add(h); out.append(h)
+    return out
 
-    Returns a short status string. Designed to run with osu! closed.
+
+def _mutate_collections(db_path: Path, fn) -> None:
+    """Read collection.db, back it up, apply fn(collections)->collections, write back.
+
+    Every mutation goes through here so they all get the same .bak safety net.
+    Designed to run with osu! closed.
     """
     db_path = Path(db_path)
     version, collections = read_collection_db(db_path)
@@ -826,15 +839,92 @@ def upsert_collection(db_path: Path, name: str, hashes: list) -> str:
             backup.write_bytes(db_path.read_bytes())
         except OSError:
             pass
-    # de-dupe while preserving order
-    seen, uniq = set(), []
-    for h in hashes:
-        if h and h not in seen:
-            seen.add(h); uniq.append(h)
-    collections = [(n, h) for (n, h) in collections if n != name]
-    collections.append((name, uniq))
-    write_collection_db(db_path, version or DEFAULT_DB_VERSION, collections)
+    write_collection_db(db_path, version or DEFAULT_DB_VERSION, fn(collections))
+
+
+def list_collections(db_path: Path) -> list:
+    """Return [(name, map_count), ...] for the collections in collection.db."""
+    _, collections = read_collection_db(db_path)
+    return [(n, len(h)) for (n, h) in collections]
+
+
+def upsert_collection(db_path: Path, name: str, hashes: list) -> str:
+    """Create/replace a named collection in collection.db (backing up first).
+
+    Returns a short status string.
+    """
+    uniq = _dedup(hashes)
+
+    def _fn(collections):
+        collections = [(n, h) for (n, h) in collections if n != name]
+        collections.append((name, uniq))
+        return collections
+
+    _mutate_collections(db_path, _fn)
     return f"{len(uniq)} maps in collection \u201c{name}\u201d"
+
+
+def delete_collection(db_path: Path, name: str) -> bool:
+    """Remove a collection. Returns True if it existed."""
+    existed = [False]
+
+    def _fn(collections):
+        out = [(n, h) for (n, h) in collections if n != name]
+        existed[0] = len(out) != len(collections)
+        return out
+
+    _mutate_collections(db_path, _fn)
+    return existed[0]
+
+
+def rename_collection(db_path: Path, old: str, new: str) -> bool:
+    """Rename a collection. If `new` already exists, the two are merged (deduped)
+    into `new`. Returns True if `old` existed."""
+    if old == new:
+        return False
+    existed = [False]
+
+    def _fn(collections):
+        by_name = dict(collections)
+        if old not in by_name:
+            return collections
+        existed[0] = True
+        merged = _dedup(list(by_name.get(new, [])) + list(by_name[old]))
+        out = []
+        placed = False
+        for n, h in collections:
+            if n == old:
+                if not placed:              # put the merged result at old's slot
+                    out.append((new, merged)); placed = True
+            elif n == new:
+                continue                    # folded into merged
+            else:
+                out.append((n, h))
+        return out
+
+    _mutate_collections(db_path, _fn)
+    return existed[0]
+
+
+def merge_collections(db_path: Path, names: list, into: str) -> int:
+    """Combine every collection in `names` into one called `into` (deduped),
+    removing the sources. Returns the resulting map count."""
+    names = set(names)
+    result = [0]
+
+    def _fn(collections):
+        by_name = dict(collections)
+        combined = []
+        for n in list(names) + ([into] if into not in names else []):
+            combined += list(by_name.get(n, []))
+        combined = _dedup(combined)
+        result[0] = len(combined)
+        out = [(n, h) for (n, h) in collections if n not in names and n != into]
+        out.append((into, combined))
+        return out
+
+    _mutate_collections(db_path, _fn)
+    return result[0]
 
 
 def preview_collection_merge(db_path: Path, name: str, hashes: list) -> dict:
@@ -868,6 +958,119 @@ def default_collection_db_path(songs_dir: str) -> Path:
     """collection.db lives in the osu! root, i.e. the parent of the Songs folder."""
     p = Path(songs_dir) if songs_dir else Path.home()
     return p.parent / "collection.db"
+
+
+# ----------------------------------------------------------------------------
+# LIBRARY / UPDATE / FORMAT HELPERS
+# ----------------------------------------------------------------------------
+def set_current_checksums(s: "Beatmapset") -> set:
+    """The set of per-diff .osu md5s the mirror reports for this set (may be empty
+    if the source didn't provide checksums)."""
+    return {d.checksum for d in s.diffs if d.checksum}
+
+
+def local_osz_is_outdated(osz_path, s: "Beatmapset"):
+    """True if the local .osz is missing any of the set's current diff checksums
+    (i.e. a newer version exists). False if up to date. None if we can't tell
+    (no checksums known, or the file can't be read)."""
+    current = set_current_checksums(s)
+    if not current:
+        return None
+    local = set(md5s_from_osz(osz_path))
+    if not local:
+        return None
+    return not current.issubset(local)
+
+
+def library_stats(songs_dir: str) -> dict:
+    """Cheap, top-level library summary: how many beatmapsets are present and the
+    total size of the .osz files sitting in the download folder. Extracted map
+    folders are counted but not deep-walked (kept fast for huge libraries)."""
+    ids = scan_downloaded_ids(songs_dir)
+    osz_bytes = osz_files = 0
+    p = Path(songs_dir) if songs_dir else None
+    if p and p.is_dir():
+        try:
+            for entry in p.iterdir():
+                try:
+                    if entry.is_file() and entry.suffix.lower() == ".osz":
+                        osz_bytes += entry.stat().st_size
+                        osz_files += 1
+                except OSError:
+                    continue
+        except OSError:
+            pass
+    return {"count": len(ids), "osz_files": osz_files, "osz_bytes": osz_bytes}
+
+
+def fmt_size(nbytes: int) -> str:
+    """Human-readable byte size (e.g. '4.2 GB')."""
+    n = float(nbytes or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def fmt_speed(bytes_per_sec: float) -> str:
+    """Download speed as '3.4 MB/s'."""
+    if not bytes_per_sec or bytes_per_sec < 0:
+        return ""
+    return f"{fmt_size(bytes_per_sec)}/s"
+
+
+def fmt_eta(seconds) -> str:
+    """Remaining time as 'm:ss' (or 'h:mm:ss'). '' when unknown."""
+    if seconds is None or seconds < 0:
+        return ""
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+# ----------------------------------------------------------------------------
+# DOWNLOAD QUEUE PERSISTENCE
+# ----------------------------------------------------------------------------
+# A queued Beatmapset is stored as a tiny dict -- just enough to rebuild the row
+# and download it after a restart. Full metadata (diffs etc.) isn't needed to
+# download, so we keep it minimal.
+def queue_item_to_dict(s: "Beatmapset") -> dict:
+    return {"id": s.id, "title": s.title, "artist": s.artist,
+            "creator": s.creator, "status": s.status, "cover_url": s.cover_url}
+
+
+def queue_item_from_dict(d: dict) -> "Beatmapset":
+    variant = "card" + "@2x.jpg"
+    sid = int(d.get("id", 0) or 0)
+    return Beatmapset(
+        id=sid, title=d.get("title", "(unknown)"), artist=d.get("artist", ""),
+        creator=d.get("creator", ""), status=d.get("status", ""),
+        bpm=0, play_count=0, favourite_count=0,
+        cover_url=d.get("cover_url") or f"https://assets.ppy.sh/beatmaps/{sid}/covers/{variant}",
+        diffs=[], minimal=True,
+    )
+
+
+def save_queue(path: Path, sets: list) -> None:
+    """Persist the pending download queue (list of Beatmapset) to JSON."""
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps([queue_item_to_dict(s) for s in sets]))
+    except OSError as e:
+        log.warning("could not save download queue %s: %s", path, e)
+
+
+def load_queue(path: Path) -> list:
+    """Restore a persisted download queue. [] if missing/corrupt."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        return []
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not read download queue %s: %s", path, e)
+        return []
+    return [queue_item_from_dict(d) for d in data if isinstance(d, dict) and d.get("id")]
 
 
 _MEDAL_ROW_RE = re.compile(r"^\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*$")

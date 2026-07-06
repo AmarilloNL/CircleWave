@@ -316,3 +316,149 @@ def test_passes_range_bpm_and_length():
     assert not c.passes_range(s, _f(bpm_min=200, bpm_max=0))
     assert c.passes_range(s, _f(len_min=60, len_max=120))
     assert not c.passes_range(s, _f(len_min=120, len_max=0))
+
+
+# --------------------------------------------------------------------------
+# Collection manager operations
+# --------------------------------------------------------------------------
+def _make_db(tmp_path, cols):
+    db = tmp_path / "collection.db"
+    c.write_collection_db(db, c.DEFAULT_DB_VERSION, cols)
+    return db
+
+
+def test_list_collections(tmp_path):
+    db = _make_db(tmp_path, [("A", ["1" * 32, "2" * 32]), ("B", ["3" * 32])])
+    assert c.list_collections(db) == [("A", 2), ("B", 1)]
+
+
+def test_delete_collection(tmp_path):
+    db = _make_db(tmp_path, [("A", ["1" * 32]), ("B", ["2" * 32])])
+    assert c.delete_collection(db, "A") is True
+    assert c.list_collections(db) == [("B", 1)]
+    assert c.delete_collection(db, "nope") is False
+
+
+def test_rename_collection_simple(tmp_path):
+    db = _make_db(tmp_path, [("Old", ["1" * 32]), ("Keep", ["2" * 32])])
+    assert c.rename_collection(db, "Old", "New") is True
+    names = dict(c.list_collections(db))
+    assert names == {"New": 1, "Keep": 1}
+    assert c.rename_collection(db, "ghost", "X") is False
+
+
+def test_rename_into_existing_merges(tmp_path):
+    db = _make_db(tmp_path, [("A", ["1" * 32, "2" * 32]), ("B", ["2" * 32, "3" * 32])])
+    assert c.rename_collection(db, "A", "B") is True   # merge A into B, dedup shared "2"
+    _, cols = c.read_collection_db(db)
+    names = dict(cols)
+    assert "A" not in names
+    assert names["B"] == ["2" * 32, "3" * 32, "1" * 32]  # B's order first, then A's new
+
+
+def test_merge_collections(tmp_path):
+    db = _make_db(tmp_path, [("A", ["1" * 32]), ("B", ["2" * 32]), ("C", ["9" * 32])])
+    count = c.merge_collections(db, ["A", "B"], into="Combined")
+    assert count == 2
+    names = dict(c.list_collections(db))
+    assert names == {"C": 1, "Combined": 2}
+
+
+def test_collection_ops_write_backup(tmp_path):
+    db = _make_db(tmp_path, [("A", ["1" * 32])])
+    before = db.read_bytes()
+    c.delete_collection(db, "A")
+    assert db.with_suffix(".db.bak").read_bytes() == before
+
+
+# --------------------------------------------------------------------------
+# Update detection
+# --------------------------------------------------------------------------
+def _osz(tmp_path, name, osu_contents):
+    p = tmp_path / name
+    with zipfile.ZipFile(p, "w") as z:
+        for i, data in enumerate(osu_contents):
+            z.writestr(f"d{i}.osu", data)
+    return p
+
+
+def test_local_osz_up_to_date(tmp_path):
+    osz = _osz(tmp_path, "s.osz", [b"aaa", b"bbb"])
+    import hashlib
+    hashes = [hashlib.md5(b).hexdigest() for b in (b"aaa", b"bbb")]
+    s = c.Beatmapset(id=1, title="", artist="", creator="", status="", bpm=0,
+                     play_count=0, favourite_count=0, cover_url="",
+                     diffs=[c.Diff("osu", 1.0, 0, 0, "d", checksum=h) for h in hashes])
+    assert c.local_osz_is_outdated(osz, s) is False
+
+
+def test_local_osz_outdated(tmp_path):
+    osz = _osz(tmp_path, "s.osz", [b"aaa"])
+    s = c.Beatmapset(id=1, title="", artist="", creator="", status="", bpm=0,
+                     play_count=0, favourite_count=0, cover_url="",
+                     diffs=[c.Diff("osu", 1.0, 0, 0, "d", checksum="f" * 32)])
+    assert c.local_osz_is_outdated(osz, s) is True
+
+
+def test_update_detection_unknown_without_checksums(tmp_path):
+    osz = _osz(tmp_path, "s.osz", [b"aaa"])
+    s = c.Beatmapset(id=1, title="", artist="", creator="", status="", bpm=0,
+                     play_count=0, favourite_count=0, cover_url="",
+                     diffs=[c.Diff("osu", 1.0, 0, 0, "d")])  # no checksum
+    assert c.local_osz_is_outdated(osz, s) is None
+
+
+# --------------------------------------------------------------------------
+# Formatting helpers
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("n,out", [
+    (0, "0 B"), (512, "512 B"), (1536, "1.5 KB"),
+    (5 * 1024 * 1024, "5.0 MB"), (3 * 1024 ** 3, "3.0 GB"),
+])
+def test_fmt_size(n, out):
+    assert c.fmt_size(n) == out
+
+
+def test_fmt_speed_and_eta():
+    assert c.fmt_speed(0) == ""
+    assert c.fmt_speed(2 * 1024 * 1024) == "2.0 MB/s"
+    assert c.fmt_eta(None) == ""
+    assert c.fmt_eta(65) == "1:05"
+    assert c.fmt_eta(3725) == "1:02:05"
+
+
+def test_library_stats(tmp_path):
+    (tmp_path / "123 Artist - Title.osz").write_bytes(b"x" * 2048)
+    (tmp_path / "456 Other - Song.osz").write_bytes(b"y" * 1024)
+    (tmp_path / "notes.txt").write_bytes(b"ignore me")
+    st = c.library_stats(str(tmp_path))
+    assert st["count"] == 2          # two setid-prefixed entries
+    assert st["osz_files"] == 2
+    assert st["osz_bytes"] == 3072
+
+
+# --------------------------------------------------------------------------
+# Download queue persistence
+# --------------------------------------------------------------------------
+def test_queue_roundtrip(tmp_path):
+    sets = [
+        c.Beatmapset(id=10, title="T1", artist="A1", creator="C1", status="ranked",
+                     bpm=0, play_count=0, favourite_count=0, cover_url="http://c1"),
+        c.Beatmapset(id=20, title="T2", artist="A2", creator="C2", status="loved",
+                     bpm=0, play_count=0, favourite_count=0, cover_url="http://c2"),
+    ]
+    qf = tmp_path / "queue.json"
+    c.save_queue(qf, sets)
+    out = c.load_queue(qf)
+    assert [s.id for s in out] == [10, 20]
+    assert out[0].title == "T1" and out[0].artist == "A1"
+    assert out[1].status == "loved"
+
+
+def test_load_queue_missing(tmp_path):
+    assert c.load_queue(tmp_path / "nope.json") == []
+
+
+def test_queue_from_dict_synthesizes_cover():
+    s = c.queue_item_from_dict({"id": 77})
+    assert s.cover_url.endswith("/beatmaps/77/covers/card@2x.jpg")
