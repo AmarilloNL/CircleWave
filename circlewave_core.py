@@ -1151,6 +1151,20 @@ def default_osu_db_path(songs_dir: str) -> Path:
     return p.parent / "osu!.db"
 
 
+def resolve_beatmap_to_set(beatmap_id: int) -> int:
+    """Resolve a single beatmap (difficulty) id to its beatmapset id via osu.direct."""
+    r = SESSION.get(f"https://osu.direct/api/v2/b/{beatmap_id}",
+                    headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    sid = data.get("beatmapset_id") or (data.get("beatmapset") or {}).get("id")
+    if not sid:
+        raise RuntimeError(f"no beatmapset for beatmap {beatmap_id}")
+    return int(sid)
+
+
 def parse_beatmap_ref(text: str):
     """Recognise a pasted osu! beatmap reference. Returns ('set', id),
     ('beatmap', id), or None. Beatmapset links win over the '#osu/<diff>' fragment;
