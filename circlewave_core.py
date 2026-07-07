@@ -15,6 +15,7 @@ import os
 import re
 import json
 import time
+import struct
 import hashlib
 import logging
 import threading
@@ -85,7 +86,7 @@ def _osu_throttle():
 # Branding. APP_TITLE is the one place to change the product name -- it drives
 # the window title and the header wordmark.
 APP_TITLE = "Circlewave"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 APP_TAGLINE = "osu! beatmap browser & downloader"
 ORG_NAME = "AmarilloNL"
 APP_NAME = "Circlewave"
@@ -964,6 +965,222 @@ def default_collection_db_path(songs_dir: str) -> Path:
     """collection.db lives in the osu! root, i.e. the parent of the Songs folder."""
     p = Path(songs_dir) if songs_dir else Path.home()
     return p.parent / "collection.db"
+
+
+def collection_hashes_for_sets(sets, fetch_fn=None) -> list:
+    """All unique per-diff .osu checksums across `sets`, for building a collection
+    from hand-picked maps. A set whose diffs carry no checksums (e.g. a mirror
+    search result) is enriched via fetch_fn(set_id)->Beatmapset when provided."""
+    out = []
+    for s in sets:
+        cs = [d.checksum for d in s.diffs if d.checksum]
+        if not cs and fetch_fn:
+            try:
+                cs = [d.checksum for d in fetch_fn(s.id).diffs if d.checksum]
+            except Exception as e:  # noqa: BLE001
+                log.debug("checksum fetch failed for %s: %s", getattr(s, "id", "?"), e)
+        out.extend(cs)
+    return _dedup(out)
+
+
+# ---- collection export / import (shareable, no server) ----------------------
+def collections_to_json(db_path: Path, names=None) -> dict:
+    """Serialise collections to a portable dict a friend can import. `names`
+    limits the export; None exports all."""
+    _, cols = read_collection_db(db_path)
+    if names is not None:
+        keep = set(names)
+        cols = [(n, h) for (n, h) in cols if n in keep]
+    return {"app": "circlewave", "type": "collections", "version": 1,
+            "collections": [{"name": n, "hashes": h} for (n, h) in cols]}
+
+
+def import_collections_into_db(db_path: Path, data) -> int:
+    """Merge exported collections (dict from collections_to_json, or a bare list)
+    into collection.db. Same-named collections are merged, not overwritten.
+    Returns how many collections were imported."""
+    if isinstance(data, dict):
+        items = data.get("collections", [])
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = []
+    existing = dict(read_collection_db(db_path)[1])
+    n = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = (it.get("name") or "").strip()
+        hashes = [h for h in (it.get("hashes") or []) if isinstance(h, str)]
+        if not name or not hashes:
+            continue
+        merged = _dedup(list(existing.get(name, [])) + hashes)
+        upsert_collection(db_path, name, merged)
+        existing[name] = merged
+        n += 1
+    return n
+
+
+# ----------------------------------------------------------------------------
+# osu!.db  (osu!stable's master beatmap database -- exact installed maps + hashes)
+# ----------------------------------------------------------------------------
+class _DbReader:
+    """Little-endian cursor over an osu! binary DB (osu!.db / collection.db)."""
+    def __init__(self, buf: bytes):
+        self.b = buf
+        self.p = 0
+
+    def byte(self):
+        v = self.b[self.p]; self.p += 1
+        return v
+
+    def boolean(self):
+        return self.byte() != 0
+
+    def short(self):
+        v = int.from_bytes(self.b[self.p:self.p + 2], "little"); self.p += 2
+        return v
+
+    def integer(self):
+        v = int.from_bytes(self.b[self.p:self.p + 4], "little"); self.p += 4
+        return v
+
+    def long(self):
+        v = int.from_bytes(self.b[self.p:self.p + 8], "little"); self.p += 8
+        return v
+
+    def single(self):
+        v = struct.unpack_from("<f", self.b, self.p)[0]; self.p += 4
+        return v
+
+    def double(self):
+        v = struct.unpack_from("<d", self.b, self.p)[0]; self.p += 8
+        return v
+
+    def string(self):
+        s, self.p = _read_osu_string(self.b, self.p)
+        return s
+
+    def int_double_pair(self):
+        # osu! stores these as: byte 0x08, Int32, byte 0x0d, Double
+        self.byte(); self.integer(); self.byte(); self.double()
+
+
+def read_osu_db(path, max_beatmaps=None) -> dict:
+    """Parse osu!stable's osu!.db into {version, player, beatmaps:[...]}, where each
+    beatmap is {md5, beatmap_id, set_id, folder, status, mode, diff}.
+
+    Follows the documented layout (osu! wiki / OsuParsers). Raises on malformed
+    input -- callers should fall back to a folder scan on any exception. Only the
+    modern layout (version >= 20140609) is supported; older DBs raise."""
+    r = _DbReader(Path(path).read_bytes())
+    version = r.integer()
+    if version < 20140609:
+        raise ValueError(f"unsupported osu!.db version {version}")
+    folder_count = r.integer()
+    r.boolean()              # account unlocked
+    r.long()                 # unlock date
+    player = r.string()
+    count = r.integer()
+    has_entry_size = version < 20191106       # removed in 20191106
+    beatmaps = []
+    for _ in range(count):
+        if has_entry_size:
+            r.integer()                        # entry size in bytes
+        r.string(); r.string()                 # artist, artist unicode
+        r.string(); r.string()                 # title, title unicode
+        r.string()                             # creator
+        diff = r.string()                      # difficulty (version) name
+        r.string()                             # audio filename
+        md5 = r.string()
+        r.string()                             # .osu filename
+        status = r.byte()
+        r.short(); r.short(); r.short()        # hitcircles, sliders, spinners
+        r.long()                               # last modified
+        r.single(); r.single(); r.single(); r.single()   # AR, CS, HP, OD
+        r.double()                             # slider velocity
+        for _mode in range(4):                 # star-rating pairs per mode
+            for _ in range(r.integer()):
+                r.int_double_pair()
+        r.integer()                            # drain time
+        r.integer()                            # total time
+        r.integer()                            # preview time
+        for _ in range(r.integer()):           # timing points
+            r.double(); r.double(); r.boolean()
+        beatmap_id = r.integer()
+        set_id = r.integer()
+        r.integer()                            # thread id
+        r.byte(); r.byte(); r.byte(); r.byte() # grades (std/taiko/ctb/mania)
+        r.short()                              # local offset
+        r.single()                             # stack leniency
+        mode = r.byte()
+        r.string()                             # source
+        r.string()                             # tags
+        r.short()                              # online offset
+        r.string()                             # title font
+        r.boolean()                            # unplayed
+        r.long()                               # last played
+        r.boolean()                            # is osz2
+        folder = r.string()
+        r.long()                               # last checked against repo
+        r.boolean(); r.boolean(); r.boolean(); r.boolean(); r.boolean()  # ignore/disable flags
+        r.integer()                            # last modification time
+        r.byte()                               # mania scroll speed
+        beatmaps.append({"md5": md5, "beatmap_id": beatmap_id, "set_id": set_id,
+                         "folder": folder, "status": status, "mode": mode, "diff": diff})
+        if max_beatmaps and len(beatmaps) >= max_beatmaps:
+            break
+    return {"version": version, "player": player,
+            "folder_count": folder_count, "beatmaps": beatmaps}
+
+
+def osu_db_set_ids(path) -> set:
+    """Set of beatmapset ids present in osu!.db (exact installed list). Empty set
+    on any parse error, so callers can fall back to a folder scan."""
+    try:
+        db = read_osu_db(path)
+    except Exception as e:  # noqa: BLE001
+        log.info("osu!.db parse failed (%s); falling back to folder scan", e)
+        return set()
+    return {b["set_id"] for b in db["beatmaps"] if b.get("set_id", 0) > 0}
+
+
+def default_osu_db_path(songs_dir: str) -> Path:
+    """osu!.db sits in the osu! root, next to the Songs folder."""
+    p = Path(songs_dir) if songs_dir else Path.home()
+    return p.parent / "osu!.db"
+
+
+def resolve_beatmap_to_set(beatmap_id: int) -> int:
+    """Resolve a single beatmap (difficulty) id to its beatmapset id via osu.direct."""
+    r = SESSION.get(f"https://osu.direct/api/v2/b/{beatmap_id}",
+                    headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    sid = data.get("beatmapset_id") or (data.get("beatmapset") or {}).get("id")
+    if not sid:
+        raise RuntimeError(f"no beatmapset for beatmap {beatmap_id}")
+    return int(sid)
+
+
+def parse_beatmap_ref(text: str):
+    """Recognise a pasted osu! beatmap reference. Returns ('set', id),
+    ('beatmap', id), or None. Beatmapset links win over the '#osu/<diff>' fragment;
+    a bare number is treated as a set id."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = re.search(r"beatmapsets/(\d+)", t) or re.search(r"/s/(\d+)", t)
+    if m:
+        return ("set", int(m.group(1)))
+    m = re.search(r"(?:beatmaps|/b)/(\d+)", t)
+    if m:
+        return ("beatmap", int(m.group(1)))
+    if t.isdigit():
+        return ("set", int(t))
+    return None
 
 
 # ----------------------------------------------------------------------------
