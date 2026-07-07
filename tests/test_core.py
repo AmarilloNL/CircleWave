@@ -549,3 +549,134 @@ def test_scan_local_updates_can_stop(tmp_path):
         raise RuntimeError("stop after first")
     c.scan_local_updates(str(tmp_path), fetch, should_stop=lambda: len(calls) >= 1)
     assert len(calls) == 1                      # stopped before the second file
+
+
+# --------------------------------------------------------------------------
+# Paste-a-link parsing
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("text,exp", [
+    ("https://osu.ppy.sh/beatmapsets/12345", ("set", 12345)),
+    ("https://osu.ppy.sh/beatmapsets/12345#osu/999", ("set", 12345)),
+    ("osu.ppy.sh/s/777", ("set", 777)),
+    ("https://osu.ppy.sh/beatmaps/456", ("beatmap", 456)),
+    ("https://osu.ppy.sh/b/456", ("beatmap", 456)),
+    ("  42  ", ("set", 42)),
+    ("freedom dive", None),
+    ("", None),
+])
+def test_parse_beatmap_ref(text, exp):
+    assert c.parse_beatmap_ref(text) == exp
+
+
+# --------------------------------------------------------------------------
+# Collection export / import + hashing from sets
+# --------------------------------------------------------------------------
+def test_collections_export_import(tmp_path):
+    db = tmp_path / "collection.db"
+    c.write_collection_db(db, c.DEFAULT_DB_VERSION,
+                          [("A", ["1" * 32]), ("B", ["2" * 32, "3" * 32])])
+    data = c.collections_to_json(db)
+    assert data["type"] == "collections" and len(data["collections"]) == 2
+    assert [x["name"] for x in c.collections_to_json(db, names=["B"])["collections"]] == ["B"]
+
+    db2 = tmp_path / "c2.db"
+    c.write_collection_db(db2, c.DEFAULT_DB_VERSION, [("A", ["9" * 32])])
+    n = c.import_collections_into_db(db2, data)
+    assert n == 2
+    got = dict(c.list_collections(db2))
+    assert got["A"] == 2 and got["B"] == 2      # A merged (9.. + 1..), B added
+
+
+def test_import_from_bare_list(tmp_path):
+    db = tmp_path / "c.db"
+    n = c.import_collections_into_db(db, [{"name": "X", "hashes": ["a" * 32, "a" * 32]}])
+    assert n == 1 and dict(c.list_collections(db)) == {"X": 1}
+
+
+def test_collection_hashes_for_sets():
+    s1 = c.Beatmapset(id=1, title="", artist="", creator="", status="", bpm=0,
+                      play_count=0, favourite_count=0, cover_url="",
+                      diffs=[c.Diff("osu", 1, 0, 0, "d", checksum="a" * 32),
+                             c.Diff("osu", 2, 0, 0, "d2", checksum="b" * 32)])
+    s2 = c.Beatmapset(id=2, title="", artist="", creator="", status="", bpm=0,
+                      play_count=0, favourite_count=0, cover_url="", diffs=[])
+
+    def fetch(sid):
+        return c.Beatmapset(id=sid, title="", artist="", creator="", status="", bpm=0,
+                            play_count=0, favourite_count=0, cover_url="",
+                            diffs=[c.Diff("osu", 3, 0, 0, "d", checksum="c" * 32),
+                                   c.Diff("osu", 1, 0, 0, "dup", checksum="a" * 32)])
+
+    out = c.collection_hashes_for_sets([s1, s2], fetch_fn=fetch)
+    assert out == ["a" * 32, "b" * 32, "c" * 32]   # deduped; s2 enriched; dup dropped
+
+
+# --------------------------------------------------------------------------
+# osu!.db parser -- validated against a hand-built synthetic DB
+# --------------------------------------------------------------------------
+def _osu_db_bytes(beatmaps, version=20211111, player="me"):
+    import struct as st
+
+    def s(x):
+        return c._write_osu_string(x)
+
+    def i(n):
+        return n.to_bytes(4, "little")
+
+    def sh(n):
+        return n.to_bytes(2, "little")
+
+    def lg(n):
+        return n.to_bytes(8, "little")
+
+    out = bytearray()
+    out += i(version) + i(3) + b"\x01" + lg(0) + s(player) + i(len(beatmaps))
+    for bm in beatmaps:
+        out += s("Artist") + s("") + s("Title") + s("") + s("creator")
+        out += s(bm.get("diff", "Hard")) + s("a.mp3") + s(bm["md5"]) + s("f.osu")
+        out += bytes([bm.get("status", 4)]) + sh(0) + sh(0) + sh(0) + lg(0)
+        out += st.pack("<ffff", 5, 4, 6, 7) + st.pack("<d", 1.4)   # AR CS HP OD, SV
+        out += i(1) + b"\x08" + i(0) + b"\x0d" + st.pack("<d", 3.5)  # std: 1 star pair
+        out += i(0) + i(0) + i(0)                                    # taiko/ctb/mania: none
+        out += i(60000) + i(90000) + i(1000)                        # drain/total/preview
+        out += i(1) + st.pack("<dd", 500.0, 0.0) + b"\x01"          # 1 timing point
+        out += i(bm.get("beatmap_id", 111)) + i(bm["set_id"]) + i(0)  # ids, thread
+        out += b"\x00\x00\x00\x00" + sh(0) + st.pack("<f", 0.7)     # grades, offset, stack
+        out += bytes([bm.get("mode", 0)]) + s("") + s("tags") + sh(0) + s("")  # mode, src, tags, online, font
+        out += b"\x00" + lg(0) + b"\x00"                            # unplayed, lastplayed, osz2
+        out += s(bm.get("folder", "123 X - Y")) + lg(0)            # folder, last checked
+        out += b"\x00\x00\x00\x00\x00" + i(0) + b"\x00"           # 5 flags, last-mod, mania speed
+    return bytes(out)
+
+
+def test_read_osu_db_roundtrip(tmp_path):
+    p = tmp_path / "osu!.db"
+    p.write_bytes(_osu_db_bytes([
+        {"md5": "a" * 32, "set_id": 100, "beatmap_id": 11, "folder": "100 X - Y", "status": 4},
+        {"md5": "b" * 32, "set_id": 200, "beatmap_id": 22, "folder": "200 P - Q", "status": 1, "mode": 3},
+    ]))
+    db = c.read_osu_db(p)
+    assert db["player"] == "me" and db["version"] == 20211111
+    assert [b["set_id"] for b in db["beatmaps"]] == [100, 200]
+    assert db["beatmaps"][0]["md5"] == "a" * 32
+    assert db["beatmaps"][1]["mode"] == 3 and db["beatmaps"][1]["folder"] == "200 P - Q"
+    assert c.osu_db_set_ids(p) == {100, 200}
+
+
+def test_read_osu_db_with_entry_size(tmp_path):
+    # Older layout (< 20191106) prefixes each beatmap with an entry-size int.
+    import struct as st
+    body = _osu_db_bytes([{"md5": "c" * 32, "set_id": 5, "folder": "5 A - B"}], version=20160408)
+    # splice a (bogus) entry-size int right after the header (before the first record)
+    # header = 4(ver)+4(folders)+1(bool)+8(long)+string(player)+4(count)
+    hdr_end = 4 + 4 + 1 + 8 + len(c._write_osu_string("me")) + 4
+    patched = body[:hdr_end] + st.pack("<i", 0) + body[hdr_end:]
+    p = tmp_path / "osu!.db"
+    p.write_bytes(patched)
+    assert c.osu_db_set_ids(p) == {5}
+
+
+def test_osu_db_bad_file_is_empty(tmp_path):
+    p = tmp_path / "osu!.db"
+    p.write_bytes(b"not a real database")
+    assert c.osu_db_set_ids(p) == set()      # graceful -> caller falls back to folder scan
