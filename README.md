@@ -73,8 +73,13 @@ two dependencies, so it's a couple of commands on any distro.
 - **Bulk + queue control** — "Download all shown" queues the visible results; Pause/Resume the
   queue, Cancel all, or cancel an individual item (✕). The queue **survives a restart** (it
   resumes from partial `.part` files), shows **live speed + ETA**, and has a **Retry failed** button.
-- **Collection manager** (🗂) — view, rename, delete and merge the collections in your
-  `collection.db`; every edit backs up first. Works alongside the pack-based collection builder.
+- **Collection manager** (🗂) — view, rename, delete, merge, and **export/import** the collections in
+  your `collection.db`; every edit backs up first. Works alongside the pack-based collection builder.
+- **Multi-select** — tick maps across searches, then **download** them, build a **new collection**, or
+  **add to an existing collection** — no download needed first (hashes are fetched as required).
+- **Paste a beatmap link or ID** into the search box to jump straight to that set.
+- **Exact library via `osu!.db`** — optionally point Settings at your osu!stable `osu!.db` for a
+  precise installed-map list behind "✓ In library" (auto-detected; falls back to the folder scan).
 - **Detail panel** (ⓘ) — expand any card for its full difficulty list and one-click **More by
   mapper / artist** searches.
 - **Presets, random & history** — save filter sets under a name (★), jump to a random result (🎲),

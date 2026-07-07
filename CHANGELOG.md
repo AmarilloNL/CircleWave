@@ -4,6 +4,21 @@ All notable changes to CircleWave are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-07-07
+
+### Added
+- **Multi-select + collection builder** — tick maps across searches and use the
+  selection bar to **download** them, build a **new collection**, or **add them
+  to an existing collection**. Collections are built from per-diff checksums
+  (fetched where needed), so no download is required first.
+- **Paste a beatmap link or ID** into the search box to jump straight to that
+  set's detail panel (beatmap/difficulty ids resolve to their set automatically).
+- **Exact library via `osu!.db`** — point Settings at your osu!stable `osu!.db`
+  (or auto-detect) for a precise installed-map list behind "✓ In library";
+  falls back to the folder scan if it can't be read.
+- **Export / import collections** — share collections as a portable JSON file
+  from the collection manager; importing merges into your `collection.db`.
+
 ## [2.0.0] - 2026-07-06
 
 ### Added
@@ -124,6 +139,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - "Already in library" detection and hide-owned, driven by your osu! Songs folder.
 - GPL-3.0 licensed; Windows `.exe` built via GitHub Actions.
 
+[2.1.0]: https://github.com/AmarilloNL/CircleWave/releases/tag/v2.1.0
 [2.0.0]: https://github.com/AmarilloNL/CircleWave/releases/tag/v2.0.0
 [1.2.1]: https://github.com/AmarilloNL/CircleWave/releases/tag/v1.2.1
 [1.2.0]: https://github.com/AmarilloNL/CircleWave/releases/tag/v1.2.0
