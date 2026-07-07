@@ -410,6 +410,7 @@ class BeatmapCard(QFrame):
     previewRequested = Signal(int)
     downloadRequested = Signal(object)
     detailsRequested = Signal(object)
+    selectionToggled = Signal(object, bool)   # (Beatmapset, selected)
 
     def __init__(self, s: Beatmapset, downloaded: bool):
         super().__init__()
@@ -454,6 +455,18 @@ class BeatmapCard(QFrame):
         self.sr_badge.raise_()
         if s.minimal:
             self.sr_badge.hide()
+
+        # --- selection checkbox (overlay, bottom-left of the cover) ---
+        self.select_btn = QToolButton(self.cover)
+        self.select_btn.setObjectName("selbtn")
+        self.select_btn.setCheckable(True)
+        self.select_btn.setText("➕")          # heavy plus; becomes ✓ when checked
+        self.select_btn.setToolTip("Select for bulk actions (download / build a collection)")
+        self.select_btn.setCursor(Qt.PointingHandCursor)
+        self.select_btn.adjustSize()
+        self.select_btn.move(8, self.COVER_H - self.select_btn.height() - 8)
+        self.select_btn.raise_()
+        self.select_btn.toggled.connect(self._on_select_toggled)
 
         # --- info block (labels always present; filled from whatever we have) ---
         body = QVBoxLayout()
@@ -588,6 +601,17 @@ class BeatmapCard(QFrame):
         for w in (self, self.dl_btn):
             w.style().unpolish(w)
             w.style().polish(w)
+
+    def _on_select_toggled(self, checked: bool):
+        self.select_btn.setText("✓" if checked else "➕")
+        self.selectionToggled.emit(self.s, checked)
+
+    def set_selected(self, yes: bool):
+        """Reflect external selection state without re-emitting the signal."""
+        self.select_btn.blockSignals(True)
+        self.select_btn.setChecked(yes)
+        self.select_btn.setText("✓" if yes else "➕")
+        self.select_btn.blockSignals(False)
 
     def mark_queued(self):
         self.dl_btn.setEnabled(False)
@@ -1285,6 +1309,19 @@ class SettingsDialog(QDialog):
         cdb_row.addWidget(cb)
         form.addRow("osu! collection.db", self._wrap(cdb_row))
 
+        # osu!.db (osu!stable) - optional; gives an exact installed-map list.
+        self.osu_db = QLineEdit(settings.value("osu_db", ""))
+        self.osu_db.setPlaceholderText("pick your osu!stable osu!.db for exact library detection (optional)")
+        odb_row = QHBoxLayout()
+        odb_row.addWidget(self.osu_db, 1)
+        odet = QPushButton("Auto-detect")
+        odet.clicked.connect(self._autodetect_osudb)
+        odb_row.addWidget(odet)
+        ob = QPushButton("Browse…")
+        ob.clicked.connect(self._browse_osudb)
+        odb_row.addWidget(ob)
+        form.addRow("osu! osu!.db", self._wrap(odb_row))
+
         self.concurrency = QSpinBox()
         self.concurrency.setRange(1, 8)
         self.concurrency.setValue(int(settings.value("concurrency", 3)))
@@ -1357,6 +1394,22 @@ class SettingsDialog(QDialog):
                 f"No collection.db found at the expected location:\n\n{guess}\n\n"
                 "Pick it manually with Browse, or leave blank.")
 
+    def _browse_osudb(self):
+        start = self.osu_db.text() or self.songs_dir.text() or str(Path.home())
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Select osu!.db", start, "osu! database (osu!.db);;All files (*)")
+        if f:
+            self.osu_db.setText(f)
+
+    def _autodetect_osudb(self):
+        guess = default_osu_db_path(self.songs_dir.text())
+        if guess.exists():
+            self.osu_db.setText(str(guess))
+        else:
+            QMessageBox.information(self, "Auto-detect",
+                f"No osu!.db found at the expected location:\n\n{guess}\n\n"
+                "Pick it manually with Browse, or leave blank.")
+
     def _autodetect(self):
         found = candidate_songs_dirs()
         if found:
@@ -1389,6 +1442,7 @@ class SettingsDialog(QDialog):
     def _save(self):
         self.settings.setValue("songs_dir", self.songs_dir.text().strip())
         self.settings.setValue("collection_db", self.collection_db.text().strip())
+        self.settings.setValue("osu_db", self.osu_db.text().strip())
         self.settings.setValue("concurrency", self.concurrency.value())
         self.settings.setValue("auto_open", "true" if self.auto_open.isChecked() else "false")
         self.settings.setValue("accent", self.accent.currentData())
@@ -1433,7 +1487,8 @@ class CollectionManagerDialog(QDialog):
         btns = QHBoxLayout()
         btns.setSpacing(8)
         for text, slot in [("Rename", self._rename), ("Delete", self._delete),
-                           ("Merge selected", self._merge)]:
+                           ("Merge selected", self._merge),
+                           ("Export…", self._export), ("Import…", self._import)]:
             b = QPushButton(text)
             b.setObjectName("smallbtn")
             b.clicked.connect(slot)
@@ -1537,6 +1592,46 @@ class CollectionManagerDialog(QDialog):
             return
         QMessageBox.information(self, "Merged",
                                 f"“{target}” now has {count} maps.")
+        self._reload()
+
+    def _export(self):
+        if not self._guard():
+            return
+        names = self._selected_names() or None      # None = export everything
+        data = collections_to_json(self.db_path, names)
+        if not data["collections"]:
+            QMessageBox.information(self, "Export", "There's nothing to export.")
+            return
+        suggested = (names[0] if names and len(names) == 1 else "collections")
+        f, _ = QFileDialog.getSaveFileName(
+            self, "Export collections", f"{sanitize_filename(suggested)}.json",
+            "CircleWave collections (*.json);;All files (*)")
+        if not f:
+            return
+        try:
+            Path(f).write_text(json.dumps(data, indent=2))
+        except OSError as e:
+            QMessageBox.critical(self, "Export", f"Couldn't write the file:\n{e}")
+            return
+        QMessageBox.information(self, "Export",
+                                f"Exported {len(data['collections'])} collection(s).")
+
+    def _import(self):
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Import collections", str(Path.home()),
+            "CircleWave collections (*.json);;All files (*)")
+        if not f:
+            return
+        try:
+            data = json.loads(Path(f).read_text())
+            n = import_collections_into_db(self.db_path, data)
+        except Exception as e:  # noqa: BLE001
+            log.exception("collection import failed")
+            QMessageBox.critical(self, "Import", f"Couldn't import:\n{e}")
+            return
+        QMessageBox.information(self, "Import",
+                                f"Imported/merged {n} collection(s)." if n else
+                                "Nothing to import from that file.")
         self._reload()
 
 
@@ -1678,6 +1773,7 @@ class MainWindow(QMainWindow):
         self.dl_workers = {}       # setid -> active DownloadWorker
         self.dl_pending = []       # list[Beatmapset] waiting for a free slot
         self.dl_failed = {}        # setid -> Beatmapset for failed (retryable) items
+        self.selected = {}         # setid -> Beatmapset picked for bulk actions
         self.dl_paused = False
         self.dl_concurrency = int(self.settings.value("concurrency", 3))
         self.downloaded_ids = set()
@@ -1745,6 +1841,29 @@ class MainWindow(QMainWindow):
         pb.addWidget(pack_exit)
         self.pack_banner.hide()
         root.addWidget(self.pack_banner)
+
+        # selection bar (hidden until you tick some cards)
+        self.sel_bar = QFrame()
+        self.sel_bar.setObjectName("packbanner")
+        sb = QHBoxLayout(self.sel_bar)
+        sb.setContentsMargins(16, 8, 16, 8)
+        sb.setSpacing(10)
+        self.sel_label = QLabel("0 selected")
+        self.sel_label.setObjectName("packlabel")
+        sb.addWidget(self.sel_label, 1)
+        for text, slot in [("Download", self._selection_download),
+                           ("New collection…", self._selection_new_collection),
+                           ("Add to collection…", self._selection_add_to_collection)]:
+            b = QPushButton(text)
+            b.setObjectName("smallbtn")
+            b.clicked.connect(slot)
+            sb.addWidget(b)
+        clr = QPushButton("Clear")
+        clr.setObjectName("smallbtn")
+        clr.clicked.connect(self._selection_clear)
+        sb.addWidget(clr)
+        self.sel_bar.hide()
+        root.addWidget(self.sel_bar)
 
         split = QSplitter(Qt.Vertical)
         root.addWidget(split, 1)
@@ -1948,6 +2067,9 @@ class MainWindow(QMainWindow):
         card.previewRequested.connect(self.preview)
         card.downloadRequested.connect(self.enqueue_download)
         card.detailsRequested.connect(self._open_details)
+        card.selectionToggled.connect(self._on_card_selection)
+        if s.id in self.selected:            # keep tick state across re-renders
+            card.set_selected(True)
         self.flow.addWidget(card)
         self.cards[s.id] = card
         # Covers are loaded lazily for cards near the viewport (see
@@ -1956,7 +2078,94 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._load_visible_covers)
         return card
 
+    # -- multi-select / bulk actions ---------------------------------------
+    def _on_card_selection(self, s: Beatmapset, checked: bool):
+        if checked:
+            self.selected[s.id] = s
+        else:
+            self.selected.pop(s.id, None)
+        self._update_selection_bar()
+
+    def _update_selection_bar(self):
+        n = len(self.selected)
+        self.sel_bar.setVisible(n > 0)
+        self.sel_label.setText(f"{n} selected")
+
+    def _selection_clear(self):
+        self.selected.clear()
+        for card in self.cards.values():
+            card.set_selected(False)
+        self._update_selection_bar()
+
+    def _selection_download(self):
+        for s in list(self.selected.values()):
+            self.enqueue_download(s)
+        self.status_label.setText(f"Queued {len(self.selected)} selected map(s).")
+
+    def _selection_new_collection(self):
+        if not self.selected:
+            return
+        db_path = self._collection_db_path(prompt=True)
+        if not db_path:
+            return
+        name, ok = QInputDialog.getText(self, "New collection", "Collection name:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        self._build_collection_from_selection(db_path, name)
+
+    def _selection_add_to_collection(self):
+        if not self.selected:
+            return
+        db_path = self._collection_db_path(prompt=True)
+        if not db_path:
+            return
+        existing = [n for n, _ in list_collections(db_path)]
+        if existing:
+            name, ok = QInputDialog.getItem(
+                self, "Add to collection", "Collection (type a new name to create):",
+                existing, 0, True)
+        else:
+            name, ok = QInputDialog.getText(self, "Add to collection", "Collection name:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        self._build_collection_from_selection(db_path, name)
+
+    def _build_collection_from_selection(self, db_path, name):
+        """Gather each selected set's diff checksums (fetching where a set has none)
+        in a worker, then merge them into the named collection."""
+        sets = list(self.selected.values())
+        self.status_label.setText(f"Gathering {len(sets)} map(s) for “{name}”…")
+
+        def job():
+            hashes = collection_hashes_for_sets(sets, fetch_fn=lambda sid: fetch_card_meta(sid)[1])
+            existing = dict(read_collection_db(db_path)[1])
+            merged = list(existing.get(name, []))
+            merged += [h for h in hashes if h not in set(merged)]
+            return upsert_collection(db_path, name, merged)
+
+        w = Worker(job)
+        w.signals.result.connect(lambda status: self._on_selection_collection_done(name, db_path, status))
+        w.signals.error.connect(lambda e: self.status_label.setText(f"Collection failed: {e}"))
+        self.pool.start(w)
+
+    def _on_selection_collection_done(self, name, db_path, status):
+        self.status_label.setText(f"{status} — written to {db_path}")
+        if QMessageBox.question(
+                self, "Collection built",
+                f"{status}.\n\nAlso download these maps now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+            self._selection_download()
+
     def new_search(self):
+        # A pasted beatmap link / id jumps straight to that set instead of searching.
+        q = self.filter_bar.query.text().strip()
+        ref = parse_beatmap_ref(q)
+        if ref and ("/" in q or "ppy.sh" in q or (ref[0] == "set" and len(str(ref[1])) >= 5)):
+            self.filter_bar.query.clear()      # so filter tweaks don't re-open it
+            self._open_ref(*ref)
+            return
         if self.pack:
             self._exit_pack_mode(refresh=False)
         self.cur_filters = self.filter_bar.filters()
@@ -2542,9 +2751,20 @@ class MainWindow(QMainWindow):
         self._update_dock_empty()
 
     # -- misc ---------------------------------------------------------------
+    def _osu_db_path(self) -> Path:
+        cfg = (self.settings.value("osu_db") or "").strip()
+        return Path(cfg) if cfg else default_osu_db_path(self.settings.value("songs_dir", ""))
+
     def _refresh_downloaded(self):
         songs = self.settings.value("songs_dir", "")
-        self.downloaded_ids = scan_downloaded_ids(songs) | self.history_ids
+        ids = scan_downloaded_ids(songs) | self.history_ids
+        # osu!.db (if present) gives the exact installed set list -- more accurate
+        # than folder-name scanning, and covers oddly-named folders. Falls back
+        # silently to the folder scan on any parse issue.
+        db_path = self._osu_db_path()
+        if db_path.exists():
+            ids |= osu_db_set_ids(db_path)
+        self.downloaded_ids = ids
 
     def _open_settings(self):
         dlg = SettingsDialog(self.settings, self)
@@ -2566,6 +2786,20 @@ class MainWindow(QMainWindow):
         dlg.downloadRequested.connect(self.enqueue_download)
         dlg.searchRequested.connect(self._search_field)
         dlg.exec()
+
+    def _open_ref(self, kind: str, rid: int):
+        """Open the detail panel for a pasted beatmapset/beatmap reference."""
+        self.status_label.setText(f"Opening {kind} {rid}…")
+
+        def job():
+            set_id = rid if kind == "set" else resolve_beatmap_to_set(rid)
+            return fetch_card_meta(set_id)[1]     # full osu.direct metadata
+
+        w = Worker(job)
+        w.signals.result.connect(self._open_details)
+        w.signals.result.connect(lambda *_: self.status_label.setText("Ready"))
+        w.signals.error.connect(lambda e: self.status_label.setText(f"Couldn't open that link: {e}"))
+        self.pool.start(w)
 
     # -- map update checking ------------------------------------------------
     def _update_fetch_fn(self):
@@ -2832,6 +3066,12 @@ QToolButton#circbtn {
     min-width: 36px; min-height: 36px; max-height: 38px; color: ${accent_soft}; font-size: 14px;
 }
 QToolButton#circbtn:hover { background: ${accent}; color: ${on_accent}; }
+QToolButton#selbtn {
+    background: rgba(12,10,20,0.78); border: 1px solid ${border}; border-radius: 6px;
+    min-width: 24px; min-height: 22px; color: ${text_mid}; font-size: 12px; font-weight: 800;
+}
+QToolButton#selbtn:hover { border-color: ${accent}; color: ${accent}; }
+QToolButton#selbtn:checked { background: ${accent}; border-color: ${accent}; color: ${on_accent}; }
 QToolButton#pillbtn {
     background: ${input}; border: 1px solid ${border}; border-radius: 8px;
     padding: 6px 9px; color: ${text_mid};
