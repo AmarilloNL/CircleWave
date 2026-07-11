@@ -1,0 +1,67 @@
+name: Build macOS binary
+
+# Build manually from the Actions tab, or automatically when you push a vX.Y.Z tag.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+# Lets the workflow's GITHUB_TOKEN create/attach the GitHub Release.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # macos-14 is Apple Silicon (arm64); the produced binary is arm64-only.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -c constraints.txt pyinstaller
+
+      - name: Run tests
+        run: |
+          pip install pytest
+          python -m pytest -q
+
+      - name: Build binary
+        # Same spec as the other platforms; PyInstaller follows the import into
+        # circlewave_core.py automatically. Produces dist/CircleWave.
+        run: pyinstaller circlewave.spec
+
+      # NOTE ON SIGNING / NOTARIZATION
+      # ------------------------------
+      # This produces an *unsigned* arm64 binary. On first launch macOS Gatekeeper
+      # will block it ("cannot be opened because the developer cannot be verified")
+      # -> right-click > Open, or `xattr -dr com.apple.quarantine CircleWave`.
+      # To ship a signed + notarized build, add an Apple Developer ID cert as repo
+      # secrets and insert `codesign` + `xcrun notarytool` steps here. That
+      # requires a paid Apple Developer account and can't be done without it.
+
+      - name: Package
+        run: |
+          cd dist
+          chmod +x CircleWave
+          zip -9 CircleWave-macos-arm64.zip CircleWave
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CircleWave-macos
+          path: dist/CircleWave-macos-arm64.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/CircleWave-macos-arm64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

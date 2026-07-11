@@ -4,6 +4,77 @@ All notable changes to CircleWave are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Inline search operators** — type `star>6`, `bpm<200`, `length>120`,
+  `mode=mania`, `status=loved`, or field scopes `artist=` / `title=` / `mapper=`
+  right in the search box; they override the equivalent dropdowns for that search
+  (`parse_query`).
+- **Fuzzy / typo-tolerant matching** helpers (`fuzzy_score`, `fuzzy_rank_sets`)
+  so near-miss queries can still surface the right set.
+- **Download verification** — a finished `.osz` is checked against the set's
+  authoritative per-diff md5s; a mismatch flags the row (⚠) instead of silently
+  passing (`verify_osz`).
+- **Size / disk-space guard** — queueing a large "Download all shown" batch first
+  shows an estimated total and the destination's free space (`estimate_download_size`).
+- **Mirror health** — per-mirror speed and reliability are tracked this session and
+  the download fallback chain prefers the fastest, most reliable mirror
+  (`MirrorStats`).
+- **Collection tools** in the manager — **Stats** (installed/missing + mode
+  breakdown vs `osu!.db`), **Diff** (compare two collections), and **Cleanup**
+  (find empty, redundant/subset, and orphaned-hash collections).
+- **Command palette** (Ctrl+K) — fuzzy-filterable list of every action; type and
+  press Enter to run.
+- **osu!Collector import** — paste an osu!Collector URL or id in the collection
+  manager to import that collection straight into your `collection.db`.
+- **Offline search cache** — the first page of each search is cached; the same
+  search reopens instantly and still shows results if you're offline (up to a day
+  old).
+- **Smart-collection rule engine** (`set_matches_rule` / `filter_sets_by_rule`) —
+  materialise a collection from a saved filter rule.
+- **Collection from results** — a "Build collection from shown results" action
+  (command palette) turns whatever the current search matched into a
+  `collection.db` collection in one step.
+- **Keyboard grid navigation** — arrow keys move a focus ring between result
+  cards; Enter opens details, **P** previews, **D** downloads, **X** selects. Keys
+  are scoped to the results area, so they never interfere with typing.
+- **Auto-play previews** — an optional radio mode (command palette / `autoplay`
+  setting) advances to the next card's preview when a clip finishes.
+- **List / compact view** — a ▤ toolbar toggle (or **Ctrl+L**) switches results
+  between the hero-cover grid and a dense one-line list (status, ★, artist,
+  length, BPM, modes, mapper + the same actions), for fast bulk scanning. The
+  choice is remembered.
+- **App self-update check** — on startup CircleWave quietly checks GitHub for a
+  newer release and, if one exists, shows a note; the command palette has a
+  "Get the latest release" action. Toggle via the `check_app_update` setting.
+- **macOS CI build** — a `build-macos.yml` workflow produces an (unsigned) arm64
+  binary attached to tagged releases, alongside the Windows and Linux artifacts.
+
+### Changed
+- **Settings dialog breathing room** — taller, uniform field heights, even row
+  spacing, and aligned inline buttons (the file-picker rows no longer sit tighter
+  than the plain fields); the window sizes to fit so nothing reads as squished.
+- **No more boxed labels** — the dialog backdrop gradient was leaking onto form
+  labels and checkboxes (both direct children of the dialog), drawing an ugly box
+  behind each one; those now render as plain text on the backdrop.
+
+### Fixed
+- **Mode order on cards** — a set's modes now list in canonical game order
+  (osu! → taiko → catch → mania) instead of star-rating order, so a hybrid set
+  like *The Big Black* (an osu! marathon with one easier guest taiko diff) reads
+  "osu! taiko" rather than the confusing "taiko osu!".
+- **Approved maps were invisible** — beatmaps with the old *Approved* status (the
+  original **FREEDOM DiVE** #39804, Big Black, most 2012-era marathons) never
+  appeared under **Ranked** *or* **Any**. The "Ranked" filter only queried status
+  `ranked`, "Any" omitted approved, and the mirror can't isolate approved maps
+  (a `status=approved` query returns ordinary ranked maps) — they only come back
+  on an unfiltered query. Ranked/Any searches now pull approved maps in via a
+  supplementary no-status fetch and merge them, tagged with their real status.
+
+### Internal
+- New Qt-free helpers in `circlewave_core.py` with 54 added tests (128 total).
+
 ## [2.1.0] - 2026-07-07
 
 ### Added

@@ -16,6 +16,7 @@ import re
 import json
 import time
 import struct
+import difflib
 import hashlib
 import logging
 import threading
@@ -302,12 +303,12 @@ class Beatmapset:
 
     @property
     def modes(self) -> list:
-        seen, out = set(), []
-        for d in self.diffs:
-            if d.mode not in seen:
-                seen.add(d.mode)
-                out.append(d.mode)
-        return out
+        # Distinct modes present, in canonical game order (osu!, taiko, catch,
+        # mania) -- not the diff list's star-rating order, which would render a
+        # hybrid set awkwardly as e.g. "taiko osu!" when the taiko diff is easier.
+        seen = {d.mode for d in self.diffs}
+        order = {"osu": 0, "taiko": 1, "fruits": 2, "mania": 3}
+        return sorted(seen, key=lambda m: order.get(m, 99))
 
     @classmethod
     def from_json(cls, js: dict) -> "Beatmapset":
@@ -603,6 +604,24 @@ def _search_hinamizawa(filters: dict, token) -> tuple:
         raw = _hina_get(dict(base, offset=offset), codes[0])
         sets = list(raw)
         next_token = offset + HINA_AMOUNT if len(raw) >= HINA_AMOUNT else None
+
+    # Approved maps (RankedStatus 2 -- e.g. the original FREEDOM DiVE, and most
+    # 2012-era marathons) are "ranked" for leaderboard/pp purposes, but the mirror
+    # can't isolate them: a status=2 query returns ordinary ranked maps, so they
+    # only ever surface in a *no-status* query. When the user wants ranked/any,
+    # pull them in with one unfiltered fetch (first page only) and merge the
+    # approved hits, tagged by their real RankedStatus. See _search_hinamizawa.
+    if token is None and q and filters.get("status") in ("ranked", "all"):
+        approved_base = {k: v for k, v in base.items() if k not in ("sort", "offset")}
+        try:
+            extra = [s for s in _hina_get(approved_base) if s.status == "approved"]
+        except Exception as e:  # noqa: BLE001
+            log.info("approved-map merge failed (%s)", e)
+            extra = []
+        if extra:
+            have = {s.id for s in sets}
+            sets = sets + [s for s in extra if s.id not in have]
+            sets = _client_sort(sets, filters.get("sort"))
 
     # stars + length client-side (bpm is filtered server-side; bpm fields are 0)
     if any(filters.get(k) for k in ("sr_min", "sr_max", "len_min", "len_max")):
@@ -1571,3 +1590,510 @@ def fetch_set_meta(set_id: int, name: str) -> tuple:
         if s.id == set_id:
             return set_id, s
     raise RuntimeError(f"set {set_id} not found via search")
+
+
+# ============================================================================
+# BATCH 1 -- fuzzy search, query syntax, collection tools, verification,
+# download estimation, and mirror health. Pure/Qt-free so the test suite
+# exercises them directly; the GUI wires these in on top.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Fuzzy / typo-tolerant search
+# ---------------------------------------------------------------------------
+def fuzzy_score(query: str, value: str) -> float:
+    """Similarity of `query` to `value` in [0.0, 1.0] (1.0 = identical).
+
+    A substring match scores high regardless of length; otherwise we fall back
+    to difflib's ratio on the best-aligned window. Case- and space-insensitive.
+    Used so 'freedom dvie' still surfaces 'FREEDOM DiVE'."""
+    q = (query or "").lower().strip()
+    v = (value or "").lower().strip()
+    if not q or not v:
+        return 0.0
+    if q == v:
+        return 1.0
+    if q in v:
+        # substring: strong but not perfect; shorter host = closer match
+        return 0.92 if len(q) >= 3 else 0.75
+    return difflib.SequenceMatcher(None, q, v).ratio()
+
+
+def fuzzy_rank_sets(sets: list, query: str, cutoff: float = 0.6) -> list:
+    """Order `sets` by fuzzy closeness of the query to 'artist title creator',
+    dropping anything below `cutoff`. A precise substring hit always wins over a
+    loose ratio. Returns a new list; input is untouched. Meant as a client-side
+    fallback when a strict search returns little/nothing."""
+    scored = []
+    for s in sets:
+        hay = " ".join(x for x in (s.artist, s.title, s.creator) if x)
+        best = max(fuzzy_score(query, hay),
+                   fuzzy_score(query, s.title or ""),
+                   fuzzy_score(query, s.artist or ""),
+                   fuzzy_score(query, s.creator or ""))
+        if best >= cutoff:
+            scored.append((best, s))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [s for _, s in scored]
+
+
+# ---------------------------------------------------------------------------
+# Advanced query syntax: 'camellia star>6 bpm<200 mode=mania'
+# ---------------------------------------------------------------------------
+_MODE_ALIASES = {
+    "osu": 0, "std": 0, "standard": 0, "o": 0,
+    "taiko": 1, "t": 1,
+    "ctb": 2, "fruits": 2, "catch": 2, "f": 2,
+    "mania": 3, "m": 3,
+}
+# Maps a query-syntax field key to the `option` code the search actually consumes
+# (see SEARCH_FIELDS / _FIELD_GETTERS) -- NOT the display label.
+_FIELD_ALIASES = {
+    "artist": "artist", "title": "title",
+    "mapper": "creator", "creator": "creator",
+}
+_QUERY_TOKEN = re.compile(
+    r'(?P<key>artist|title|mapper|creator|star|stars|sr|bpm|length|len|mode|status)'
+    r'(?P<op>[<>=:])'
+    r'(?P<val>"[^"]*"|\S+)',
+    re.IGNORECASE,
+)
+
+
+def parse_query(text: str) -> dict:
+    """Parse a search string with inline operators into a partial filter dict.
+
+    Recognised: star/sr/bpm/length with < > = (e.g. star>6, bpm<=200 via bpm<200),
+    mode=<name>, status=<word>, and field scopes artist=/title=/mapper=. Anything
+    unrecognised stays as free text under 'q'. Only keys that were actually
+    specified appear in the result, so callers can merge it onto a base filter."""
+    out: dict = {}
+    leftover: list = []
+    pos = 0
+    t = text or ""
+    for m in _QUERY_TOKEN.finditer(t):
+        leftover.append(t[pos:m.start()])
+        pos = m.end()
+        key = m.group("key").lower()
+        op = m.group("op")
+        val = m.group("val").strip('"')
+        if key in ("star", "stars", "sr", "bpm", "length", "len"):
+            try:
+                num = float(val)
+            except ValueError:
+                leftover.append(m.group(0))
+                continue
+            base = {"star": "sr", "stars": "sr", "sr": "sr",
+                    "bpm": "bpm", "length": "len", "len": "len"}[key]
+            if op == ">":
+                out[base + "_min"] = num
+            elif op == "<":
+                out[base + "_max"] = num
+            else:                         # '=' / ':' -> narrow band around value
+                out[base + "_min"] = num
+                out[base + "_max"] = num
+        elif key == "mode":
+            mv = _MODE_ALIASES.get(val.lower())
+            if mv is not None:
+                out["mode"] = mv
+            else:
+                leftover.append(m.group(0))
+        elif key == "status":
+            out["status"] = val.lower()
+        else:                             # field scope
+            out["option"] = _FIELD_ALIASES[key]
+            out["q"] = val
+    leftover.append(t[pos:])
+    free = re.sub(r"\s+", " ", "".join(leftover)).strip()
+    if free and "q" not in out:
+        out["q"] = free
+    elif free and out.get("option"):
+        # field scope already captured the value; keep the scoped term
+        pass
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Collection diff / cleanup / stats
+# ---------------------------------------------------------------------------
+def diff_collections(a_hashes, b_hashes) -> dict:
+    """Compare two hash lists. Returns {'added', 'removed', 'common'} as sorted
+    lists: 'added' are in b not a, 'removed' are in a not b."""
+    a, b = set(a_hashes or []), set(b_hashes or [])
+    return {"added": sorted(b - a),
+            "removed": sorted(a - b),
+            "common": sorted(a & b)}
+
+
+def find_empty_collections(collections) -> list:
+    """Names of collections with no maps."""
+    return [n for (n, h) in collections if not h]
+
+
+def find_orphan_hashes(collections, known_md5s) -> dict:
+    """Per-collection md5s that aren't present in `known_md5s` (e.g. from osu!.db).
+    Returns {name: [orphan_md5, ...]} for collections that have any. These point at
+    maps referenced by a collection but no longer installed."""
+    known = {h.lower() for h in known_md5s}
+    out = {}
+    for name, hashes in collections:
+        orphans = [h for h in hashes if h.lower() not in known]
+        if orphans:
+            out[name] = orphans
+    return out
+
+
+def find_subset_collections(collections) -> list:
+    """Find collections whose maps are fully contained in another (bigger) one.
+    Returns [(subset_name, superset_name), ...]. Useful for spotting redundant
+    collections. Empty collections are ignored."""
+    sets = [(n, set(h)) for (n, h) in collections if h]
+    out = []
+    for i, (na, sa) in enumerate(sets):
+        for j, (nb, sb) in enumerate(sets):
+            if i == j:
+                continue
+            if sa < sb or (sa == sb and i > j):   # proper subset, or dupe (keep one)
+                out.append((na, nb))
+                break
+    return out
+
+
+def collection_stats(hashes, db_beatmaps) -> dict:
+    """Summarise a collection against an osu!.db beatmap list (from read_osu_db).
+    Returns installed/missing counts and mode/status breakdowns of the installed
+    maps. `db_beatmaps` is the 'beatmaps' list; matching is by md5."""
+    by_md5 = {b["md5"].lower(): b for b in db_beatmaps if b.get("md5")}
+    total = len(hashes)
+    installed, by_mode, by_status = 0, {}, {}
+    mode_names = {0: "osu", 1: "taiko", 2: "fruits", 3: "mania"}
+    for h in hashes:
+        b = by_md5.get((h or "").lower())
+        if not b:
+            continue
+        installed += 1
+        mn = mode_names.get(b.get("mode", 0), "osu")
+        by_mode[mn] = by_mode.get(mn, 0) + 1
+        st = int(b.get("status", 0) or 0)
+        by_status[st] = by_status.get(st, 0) + 1
+    return {"total": total, "installed": installed, "missing": total - installed,
+            "by_mode": by_mode, "by_status": by_status}
+
+
+# ---------------------------------------------------------------------------
+# Download verification + size estimation + dedupe
+# ---------------------------------------------------------------------------
+def verify_osz(osz_path, s: "Beatmapset") -> dict:
+    """Check a downloaded .osz against the set's authoritative per-diff md5s.
+    Returns {'ok', 'matched', 'missing', 'extra'}: 'ok' is True if every current
+    checksum is present, False if any is missing, None if we can't tell (no
+    known checksums, or the file can't be read)."""
+    current = set_current_checksums(s)
+    local = set(md5s_from_osz(osz_path))
+    if not current:
+        return {"ok": None, "matched": sorted(local), "missing": [], "extra": []}
+    if not local:                          # unreadable / not a zip
+        return {"ok": None, "matched": [], "missing": sorted(current),
+                "extra": []}
+    missing = current - local
+    return {"ok": not missing,
+            "matched": sorted(current & local),
+            "missing": sorted(missing),
+            "extra": sorted(local - current)}
+
+
+# Rough average size of an .osz with video stripped -- used only to warn before a
+# big batch, never for exactness. Tuned to typical ranked sets (~4-8 MB/diff).
+AVG_OSZ_BYTES = 12 * 1024 * 1024
+
+
+def estimate_download_size(sets, avg_bytes: int = AVG_OSZ_BYTES) -> int:
+    """Heuristic total byte size for a batch, so callers can do a disk-space
+    guard. Uses diff count where known (a multi-diff set is bigger), else a flat
+    per-set average."""
+    total = 0
+    for s in sets:
+        n = len(getattr(s, "diffs", []) or [])
+        total += avg_bytes if n <= 1 else int(avg_bytes * (1 + 0.4 * (n - 1)))
+    return total
+
+
+def duplicate_targets(sets, owned_ids) -> list:
+    """Subset of `sets` whose id is already owned -- for a 'you already have N of
+    these' warning before queueing. Preserves order."""
+    owned = set(owned_ids or [])
+    return [s for s in sets if s.id in owned]
+
+
+# ---------------------------------------------------------------------------
+# Mirror health tracking -- prefer the mirror that's actually fast & reliable
+# ---------------------------------------------------------------------------
+class MirrorStats:
+    """In-memory tally of per-mirror outcomes so the app can prefer the fastest,
+    most reliable download source. Not persisted -- resets each run. Thread-safe
+    for the download workers."""
+
+    def __init__(self):
+        self._d = {}
+        self._lock = threading.Lock()
+
+    def _row(self, name):
+        return self._d.setdefault(
+            name, {"ok": 0, "fail": 0, "bytes": 0, "secs": 0.0})
+
+    def record(self, name: str, ok: bool, nbytes: int = 0, secs: float = 0.0):
+        with self._lock:
+            row = self._row(name)
+            if ok:
+                row["ok"] += 1
+                row["bytes"] += max(0, int(nbytes))
+                row["secs"] += max(0.0, float(secs))
+            else:
+                row["fail"] += 1
+
+    def success_rate(self, name: str) -> float:
+        row = self._d.get(name)
+        if not row:
+            return 0.0
+        n = row["ok"] + row["fail"]
+        return row["ok"] / n if n else 0.0
+
+    def speed(self, name: str) -> float:
+        """Average bytes/sec over successful downloads (0 if none measured)."""
+        row = self._d.get(name)
+        if not row or row["secs"] <= 0:
+            return 0.0
+        return row["bytes"] / row["secs"]
+
+    def order(self, names: list) -> list:
+        """`names` reordered best-first: proven-fast and reliable mirrors lead,
+        untried mirrors keep their given order in the middle, repeat failers sink.
+        Deterministic and total, so it's safe as a fallback chain."""
+        def key(n):
+            row = self._d.get(n)
+            if not row or (row["ok"] + row["fail"]) == 0:
+                return (1, 0.0, 0.0)          # untried: neutral middle
+            return (0 if self.success_rate(n) >= 0.5 else 2,
+                    -self.success_rate(n), -self.speed(n))
+        return sorted(names, key=key)
+
+
+# ============================================================================
+# BATCH 2 -- smart (rule-based) collections, osu!Collector import, and an
+# offline search-result cache. Pure/Qt-free; exercised by the test suite.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Smart / dynamic collections: a saved rule that re-materialises on demand
+# ---------------------------------------------------------------------------
+def _rule_defaults(rule: dict) -> dict:
+    """Fill the keys passes_range() reads so a partial rule is safe to evaluate."""
+    f = {"bpm_min": 0, "bpm_max": 0, "sr_min": 0, "sr_max": 0,
+         "len_min": 0, "len_max": 0, "mode": None}
+    f.update({k: v for k, v in (rule or {}).items() if v not in (None, "")})
+    if "mode" not in rule:
+        f["mode"] = None
+    return f
+
+
+def set_matches_rule(s: "Beatmapset", rule: dict) -> bool:
+    """True if a set satisfies a smart-collection rule. The rule reuses the search
+    filter shape (q, option, mode, sr/bpm/len min-max). Text is matched against the
+    scoped field (option) or, unscoped, against artist/title/creator/tags."""
+    f = _rule_defaults(rule)
+    q = (rule.get("q") or "").strip()
+    if q:
+        getter = _FIELD_GETTERS.get(rule.get("option") or "")
+        if getter:
+            if not _field_match(getter(s), q):
+                return False
+        else:
+            hay = " ".join(x for x in (s.artist, s.title, s.creator, s.tags) if x)
+            if q.lower() not in hay.lower():
+                return False
+    return passes_range(s, f)
+
+
+def filter_sets_by_rule(sets: list, rule: dict) -> list:
+    """Materialise a smart collection: the subset of `sets` matching the rule,
+    order preserved."""
+    return [s for s in sets if set_matches_rule(s, rule)]
+
+
+# ---------------------------------------------------------------------------
+# osu!Collector import  (https://osucollector.com)
+# ---------------------------------------------------------------------------
+def osucollector_to_collections(data) -> dict:
+    """Convert an osu!Collector collection (its API JSON) into the import format
+    understood by import_collections_into_db: {'collections': [{name, hashes}]}.
+
+    Tolerant of the two shapes the API returns -- a single collection object, or a
+    list/paged wrapper of them. Per-diff md5s come from each beatmap's 'checksum'."""
+    def _one(coll):
+        name = (coll.get("name") or coll.get("title") or "").strip()
+        hashes = []
+        for bs in coll.get("beatmapsets", []) or []:
+            for b in bs.get("beatmaps", []) or []:
+                h = b.get("checksum") or b.get("md5") or b.get("hash")
+                if isinstance(h, str) and h:
+                    hashes.append(h)
+        # some exports carry a flat 'beatmaps' list instead of nested beatmapsets
+        for b in coll.get("beatmaps", []) or []:
+            h = b.get("checksum") or b.get("md5")
+            if isinstance(h, str) and h:
+                hashes.append(h)
+        return {"name": name, "hashes": _dedup(hashes)} if name and hashes else None
+
+    if isinstance(data, dict) and "collections" in data and "beatmapsets" not in data:
+        candidates = data["collections"]
+    elif isinstance(data, list):
+        candidates = data
+    else:
+        candidates = [data]
+
+    out = []
+    for c in candidates:
+        if isinstance(c, dict):
+            one = _one(c)
+            if one:
+                out.append(one)
+    return {"app": "osucollector", "type": "collections",
+            "version": 1, "collections": out}
+
+
+OSUCOLLECTOR_API = "https://osucollector.com/api/collections/{id}"
+_OSUCOLLECTOR_ID = re.compile(r"osucollector\.com/collections/(\d+)")
+
+
+def parse_osucollector_ref(text: str):
+    """Extract a collection id from an osu!Collector URL or a bare number."""
+    t = (text or "").strip()
+    m = _OSUCOLLECTOR_ID.search(t)
+    if m:
+        return int(m.group(1))
+    return int(t) if t.isdigit() else None
+
+
+def fetch_osucollector(coll_id: int) -> dict:
+    """Fetch one osu!Collector collection and return it in import format."""
+    r = SESSION.get(OSUCOLLECTOR_API.format(id=int(coll_id)),
+                    headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return osucollector_to_collections(r.json())
+
+
+# ---------------------------------------------------------------------------
+# Offline search cache -- persist result pages so browsing works (and is
+# instant) without a round trip; entries expire after a TTL.
+# ---------------------------------------------------------------------------
+def _set_to_full_dict(s: "Beatmapset") -> dict:
+    """Full serialisation (incl. diffs) so cached results still support the
+    star/BPM/length filters that a minimal queue dict would drop."""
+    return {
+        "id": s.id, "title": s.title, "artist": s.artist, "creator": s.creator,
+        "status": s.status, "bpm": s.bpm, "play_count": s.play_count,
+        "favourite_count": s.favourite_count, "cover_url": s.cover_url,
+        "tags": s.tags, "minimal": s.minimal,
+        "diffs": [{"mode": d.mode, "sr": d.sr, "bpm": d.bpm, "length": d.length,
+                   "version": d.version, "checksum": d.checksum} for d in s.diffs],
+    }
+
+
+def _set_from_full_dict(d: dict) -> "Beatmapset":
+    diffs = [Diff(mode=x.get("mode", "osu"), sr=float(x.get("sr", 0) or 0),
+                  bpm=float(x.get("bpm", 0) or 0), length=int(x.get("length", 0) or 0),
+                  version=x.get("version", ""), checksum=x.get("checksum", ""))
+             for x in d.get("diffs", []) or []]
+    return Beatmapset(
+        id=int(d.get("id", 0) or 0), title=d.get("title", "(unknown)"),
+        artist=d.get("artist", ""), creator=d.get("creator", ""),
+        status=d.get("status", ""), bpm=float(d.get("bpm", 0) or 0),
+        play_count=int(d.get("play_count", 0) or 0),
+        favourite_count=int(d.get("favourite_count", 0) or 0),
+        cover_url=d.get("cover_url", ""), tags=d.get("tags", ""),
+        minimal=bool(d.get("minimal", False)), diffs=diffs)
+
+
+def search_cache_key(filters: dict) -> str:
+    """Stable key for a first-page search: the filters that affect results, hashed.
+    Excludes client-only toggles (hide_owned/no_video) that don't change the query."""
+    relevant = {k: v for k, v in (filters or {}).items()
+                if k not in ("hide_owned", "no_video")}
+    blob = json.dumps(relevant, sort_keys=True, default=str)
+    return hashlib.md5(blob.encode("utf-8")).hexdigest()
+
+
+def save_search_cache(cache_dir, filters: dict, sets: list) -> None:
+    """Cache a first result page keyed by its filters. Best-effort."""
+    try:
+        d = Path(cache_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        payload = {"ts": time.time(), "key": search_cache_key(filters),
+                   "sets": [_set_to_full_dict(s) for s in sets]}
+        (d / f"search_{search_cache_key(filters)}.json").write_text(json.dumps(payload))
+    except OSError as e:
+        log.info("could not write search cache: %s", e)
+
+
+def load_search_cache(cache_dir, filters: dict, max_age: float = 86400.0):
+    """Return cached sets for these filters if present and fresher than max_age
+    seconds, else None."""
+    try:
+        p = Path(cache_dir) / f"search_{search_cache_key(filters)}.json"
+        payload = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+    if time.time() - float(payload.get("ts", 0)) > max_age:
+        return None
+    return [_set_from_full_dict(d) for d in payload.get("sets", [])]
+
+
+# ============================================================================
+# BATCH 3 -- app self-update check against GitHub Releases.
+# ============================================================================
+GITHUB_REPO = "AmarilloNL/CircleWave"
+GITHUB_LATEST_RELEASE = "https://api.github.com/repos/{repo}/releases/latest"
+
+
+def parse_version(s: str) -> tuple:
+    """Parse a version string (optionally 'v'-prefixed, e.g. 'v2.1.0') into a tuple
+    of ints for comparison. Non-numeric trailers (e.g. '-rc1') are ignored."""
+    s = (s or "").strip().lstrip("vV")
+    parts = []
+    for chunk in s.split("."):
+        m = re.match(r"\d+", chunk)
+        parts.append(int(m.group()) if m else 0)
+    return tuple(parts) or (0,)
+
+
+def version_is_newer(candidate: str, current: str) -> bool:
+    """True if `candidate` is a strictly newer version than `current`."""
+    return parse_version(candidate) > parse_version(current)
+
+
+def fetch_latest_release(repo: str = GITHUB_REPO) -> dict:
+    """Query GitHub for the latest release. Returns {'tag', 'name', 'url'} (empty
+    strings if unavailable). Never raises for the common failure modes -- returns
+    empties so an update check can fail silently."""
+    try:
+        r = SESSION.get(GITHUB_LATEST_RELEASE.format(repo=repo),
+                        headers={"User-Agent": USER_AGENT,
+                                 "Accept": "application/vnd.github+json"},
+                        timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:  # noqa: BLE001
+        log.info("latest-release check failed: %s", e)
+        return {"tag": "", "name": "", "url": ""}
+    return {"tag": str(data.get("tag_name", "") or ""),
+            "name": str(data.get("name", "") or ""),
+            "url": str(data.get("html_url", "") or "")}
+
+
+def check_for_app_update(current: str = APP_VERSION, repo: str = GITHUB_REPO):
+    """Return {'tag','name','url'} of a newer release, or None if up to date /
+    unreachable. Suitable to run in a background worker on startup."""
+    rel = fetch_latest_release(repo)
+    if rel.get("tag") and version_is_newer(rel["tag"], current):
+        return rel
+    return None
