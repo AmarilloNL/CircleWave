@@ -680,3 +680,300 @@ def test_osu_db_bad_file_is_empty(tmp_path):
     p = tmp_path / "osu!.db"
     p.write_bytes(b"not a real database")
     assert c.osu_db_set_ids(p) == set()      # graceful -> caller falls back to folder scan
+
+
+# ==========================================================================
+# BATCH 1 -- fuzzy search, query syntax, collection tools, verification,
+# download estimation, mirror health.
+# ==========================================================================
+def _mkset(sid=1, title="", artist="", creator="", diffs=None):
+    return c.Beatmapset(
+        id=sid, title=title, artist=artist, creator=creator, status="ranked",
+        bpm=0, play_count=0, favourite_count=0, cover_url="", diffs=diffs or [])
+
+
+def test_fuzzy_score_exact_and_substring():
+    assert c.fuzzy_score("freedom dive", "FREEDOM DiVE") == 1.0
+    assert c.fuzzy_score("freedom", "FREEDOM DiVE") >= 0.9
+    assert c.fuzzy_score("", "anything") == 0.0
+
+
+def test_fuzzy_score_typo_tolerant():
+    # a one-char transposition should still score well above noise
+    assert c.fuzzy_score("freedom dvie", "freedom dive") > 0.8
+    assert c.fuzzy_score("freedom dvie", "brass beat") < 0.5
+
+
+def test_fuzzy_rank_orders_and_filters():
+    a = _mkset(1, title="FREEDOM DiVE", artist="xi")
+    b = _mkset(2, title="Blue Zenith", artist="xi")
+    ranked = c.fuzzy_rank_sets([b, a], "freedom dvie", cutoff=0.6)
+    assert [s.id for s in ranked] == [1]        # b filtered out, a kept
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("star>6", {"sr_min": 6.0}),
+    ("star<8", {"sr_max": 8.0}),
+    ("star=7", {"sr_min": 7.0, "sr_max": 7.0}),
+    ("bpm>180", {"bpm_min": 180.0}),
+    ("length<120", {"len_max": 120.0}),
+    ("mode=mania", {"mode": 3}),
+    ("mode=ctb", {"mode": 2}),
+    ("status=loved", {"status": "loved"}),
+])
+def test_parse_query_operators(text, expected):
+    assert c.parse_query(text) == expected
+
+
+def test_parse_query_field_scope_and_freetext():
+    out = c.parse_query('artist=camellia star>6')
+    assert out["option"] == "artist" and out["q"] == "camellia"
+    assert out["sr_min"] == 6.0
+    assert c.parse_query("mapper=sotarks")["option"] == "creator"
+    out2 = c.parse_query("blue zenith bpm<210")
+    assert out2["q"] == "blue zenith" and out2["bpm_max"] == 210.0
+
+
+def test_parse_query_ignores_garbage_number():
+    out = c.parse_query("star>abc hello")
+    assert "sr_min" not in out
+    assert out["q"] == "star>abc hello"
+
+
+def test_diff_collections():
+    d = c.diff_collections(["a", "b", "c"], ["b", "c", "d"])
+    assert d == {"added": ["d"], "removed": ["a"], "common": ["b", "c"]}
+
+
+def test_find_empty_and_orphans():
+    cols = [("full", ["a", "b"]), ("empty", []), ("half", ["a", "z"])]
+    assert c.find_empty_collections(cols) == ["empty"]
+    orph = c.find_orphan_hashes(cols, known_md5s={"a", "b"})
+    assert orph == {"half": ["z"]}
+
+
+def test_find_subset_collections():
+    cols = [("big", ["a", "b", "c"]), ("small", ["a", "b"]), ("other", ["x"])]
+    subs = c.find_subset_collections(cols)
+    assert ("small", "big") in subs
+    assert not any(n == "other" for n, _ in subs)
+
+
+def test_collection_stats():
+    db = [{"md5": "A", "mode": 3, "status": 4},
+          {"md5": "B", "mode": 0, "status": 5}]
+    st = c.collection_stats(["a", "b", "zzz"], db)
+    assert st["total"] == 3 and st["installed"] == 2 and st["missing"] == 1
+    assert st["by_mode"] == {"mania": 1, "osu": 1}
+
+
+def test_verify_osz(tmp_path):
+    import hashlib as _h
+    osz = tmp_path / "x.osz"
+    data = b"osu file format v14\n"
+    with zipfile.ZipFile(osz, "w") as z:
+        z.writestr("map [Easy].osu", data)
+    md5 = _h.md5(data).hexdigest()
+    good = _mkset(diffs=[c.Diff("osu", 3.0, 180, 60, "Easy", md5)])
+    res = c.verify_osz(osz, good)
+    assert res["ok"] is True and res["matched"] == [md5]
+    bad = _mkset(diffs=[c.Diff("osu", 3.0, 180, 60, "Easy", "deadbeef")])
+    assert c.verify_osz(osz, bad)["ok"] is False
+    unknown = _mkset(diffs=[c.Diff("osu", 3.0, 180, 60, "Easy", "")])
+    assert c.verify_osz(osz, unknown)["ok"] is None
+
+
+def test_estimate_download_size():
+    one = _mkset(diffs=[c.Diff("osu", 3, 180, 60, "E", "")])
+    assert c.estimate_download_size([one]) == c.AVG_OSZ_BYTES
+    multi = _mkset(diffs=[c.Diff("osu", 3, 180, 60, str(i), "") for i in range(5)])
+    assert c.estimate_download_size([multi]) > c.AVG_OSZ_BYTES
+
+
+def test_duplicate_targets():
+    a, b = _mkset(1), _mkset(2)
+    assert [s.id for s in c.duplicate_targets([a, b], {2})] == [2]
+
+
+def test_mirror_stats_order():
+    ms = c.MirrorStats()
+    ms.record("fast", ok=True, nbytes=10_000_000, secs=1.0)
+    ms.record("slow", ok=True, nbytes=1_000_000, secs=2.0)
+    ms.record("broken", ok=False)
+    ms.record("broken", ok=False)
+    order = ms.order(["broken", "slow", "fast", "untried"])
+    assert order[0] == "fast"                 # fastest reliable leads
+    assert order[-1] == "broken"              # repeat failer sinks
+    assert ms.success_rate("fast") == 1.0
+    assert ms.speed("fast") == 10_000_000.0
+
+
+# ==========================================================================
+# BATCH 2 -- smart collections, osu!Collector import, offline search cache.
+# ==========================================================================
+def _mkset2(sid=1, title="", artist="", creator="", tags="", diffs=None):
+    return c.Beatmapset(
+        id=sid, title=title, artist=artist, creator=creator, status="ranked",
+        bpm=0, play_count=0, favourite_count=0, cover_url="", tags=tags,
+        diffs=diffs or [])
+
+
+def test_set_matches_rule_stars_and_text():
+    s = _mkset2(1, title="FREEDOM DiVE", artist="xi",
+               diffs=[c.Diff("osu", 7.5, 222, 253, "FOUR DIMENSIONS", "")])
+    assert c.set_matches_rule(s, {"sr_min": 7.0})
+    assert not c.set_matches_rule(s, {"sr_min": 8.0})
+    assert c.set_matches_rule(s, {"q": "freedom"})
+    assert not c.set_matches_rule(s, {"q": "zenith"})
+    # field-scoped text
+    assert c.set_matches_rule(s, {"q": "xi", "option": "artist"})
+    assert not c.set_matches_rule(s, {"q": "xi", "option": "title"})
+
+
+def test_filter_sets_by_rule():
+    a = _mkset2(1, diffs=[c.Diff("osu", 6.5, 180, 100, "A", "")])
+    b = _mkset2(2, diffs=[c.Diff("osu", 3.0, 180, 100, "B", "")])
+    out = c.filter_sets_by_rule([a, b], {"sr_min": 5.0})
+    assert [s.id for s in out] == [1]
+
+
+def test_osucollector_import_shape():
+    data = {
+        "name": "hard jumps",
+        "beatmapsets": [
+            {"id": 10, "beatmaps": [{"checksum": "aa"}, {"checksum": "bb"}]},
+            {"id": 11, "beatmaps": [{"checksum": "aa"}]},   # dup md5 -> deduped
+        ],
+    }
+    out = c.osucollector_to_collections(data)
+    assert out["collections"] == [{"name": "hard jumps", "hashes": ["aa", "bb"]}]
+    # and it plugs straight into the existing importer format
+    assert "collections" in out
+
+
+def test_osucollector_list_and_empty():
+    out = c.osucollector_to_collections([{"name": "x", "beatmapsets": [
+        {"beatmaps": [{"md5": "zz"}]}]}])
+    assert out["collections"] == [{"name": "x", "hashes": ["zz"]}]
+    assert c.osucollector_to_collections({"name": "empty"})["collections"] == []
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("https://osucollector.com/collections/1234", 1234),
+    ("osucollector.com/collections/9/anything", 9),
+    ("42", 42),
+    ("nope", None),
+])
+def test_parse_osucollector_ref(text, expected):
+    assert c.parse_osucollector_ref(text) == expected
+
+
+def test_search_cache_roundtrip(tmp_path):
+    f = {"q": "camellia", "sr_min": 6, "hide_owned": True}
+    s = _mkset2(1, title="T", artist="A",
+                diffs=[c.Diff("mania", 5.5, 200, 120, "NM", "abc")])
+    assert c.load_search_cache(tmp_path, f) is None      # cold
+    c.save_search_cache(tmp_path, f, [s])
+    got = c.load_search_cache(tmp_path, f)
+    assert got and got[0].id == 1 and got[0].diffs[0].checksum == "abc"
+    # hide_owned/no_video don't change the key -> same cache hit
+    assert c.load_search_cache(tmp_path, dict(f, hide_owned=False)) is not None
+
+
+def test_search_cache_expiry(tmp_path):
+    f = {"q": "x"}
+    c.save_search_cache(tmp_path, f, [_mkset2(1)])
+    assert c.load_search_cache(tmp_path, f, max_age=-1) is None   # already stale
+
+
+# ==========================================================================
+# BATCH 3 -- app self-update version comparison.
+# ==========================================================================
+@pytest.mark.parametrize("s,expected", [
+    ("2.1.0", (2, 1, 0)),
+    ("v2.1.0", (2, 1, 0)),
+    ("2.10.3", (2, 10, 3)),
+    ("v3.0.0-rc1", (3, 0, 0)),
+    ("", (0,)),
+])
+def test_parse_version(s, expected):
+    assert c.parse_version(s) == expected
+
+
+def test_version_is_newer():
+    assert c.version_is_newer("2.2.0", "2.1.0")
+    assert c.version_is_newer("v2.1.1", "2.1.0")
+    assert c.version_is_newer("2.10.0", "2.9.9")   # numeric, not lexical
+    assert not c.version_is_newer("2.1.0", "2.1.0")
+    assert not c.version_is_newer("2.0.0", "2.1.0")
+
+
+def test_check_for_app_update(monkeypatch):
+    monkeypatch.setattr(c, "fetch_latest_release",
+                        lambda repo=c.GITHUB_REPO: {"tag": "v9.9.9", "name": "x", "url": "u"})
+    assert c.check_for_app_update("2.1.0")["tag"] == "v9.9.9"
+    monkeypatch.setattr(c, "fetch_latest_release",
+                        lambda repo=c.GITHUB_REPO: {"tag": "v2.1.0", "name": "", "url": ""})
+    assert c.check_for_app_update("2.1.0") is None
+    monkeypatch.setattr(c, "fetch_latest_release",
+                        lambda repo=c.GITHUB_REPO: {"tag": "", "name": "", "url": ""})
+    assert c.check_for_app_update("2.1.0") is None
+
+
+# ==========================================================================
+# Regression: Approved maps (e.g. the original FREEDOM DiVE, set 39804) are
+# "ranked" for leaderboard purposes but the mirror only returns them on a
+# no-status query. They must be merged into ranked/any results.
+# ==========================================================================
+def test_approved_maps_merged_under_ranked(monkeypatch):
+    ranked = _mkset(1); ranked.status = "ranked"
+    approved = _mkset(39804); approved.status = "approved"
+    also_ranked = _mkset(3); also_ranked.status = "ranked"   # from no-status query
+
+    def fake_hina_get(params, status_code=None):
+        if status_code == 1:            # the ranked page
+            return [ranked]
+        if status_code is None:         # the supplementary no-status merge query
+            return [approved, also_ranked]
+        return []
+
+    monkeypatch.setattr(c, "_hina_get", fake_hina_get)
+    f = {"q": "freedom dive", "status": "ranked", "sort": "ranked_asc", "mode": None,
+         "option": "", "genre": 0, "language": 0, "bpm_min": 0, "bpm_max": 0,
+         "sr_min": 0, "sr_max": 0, "len_min": 0, "len_max": 0}
+    sets, _ = c._search_hinamizawa(f, None)
+    ids = [s.id for s in sets]
+    assert 39804 in ids                 # approved map pulled in
+    assert 3 not in ids                 # non-approved hits from no-status query ignored
+    assert 1 in ids                     # original ranked results preserved
+
+
+def test_approved_merge_only_first_page(monkeypatch):
+    # On a paged (token != None) fetch we must NOT re-add approved maps.
+    calls = []
+
+    def fake_hina_get(params, status_code=None):
+        calls.append(status_code)
+        return []
+
+    monkeypatch.setattr(c, "_hina_get", fake_hina_get)
+    f = {"q": "freedom dive", "status": "ranked", "sort": "ranked_asc", "mode": None,
+         "option": "", "genre": 0, "language": 0, "bpm_min": 0, "bpm_max": 0,
+         "sr_min": 0, "sr_max": 0, "len_min": 0, "len_max": 0}
+    c._search_hinamizawa(f, token="100")
+    assert None not in calls            # no supplementary no-status query on page 2+
+
+
+def test_modes_canonical_order():
+    # A hybrid set whose taiko diff is *easier* than its osu! diff must still list
+    # osu! first (canonical game order), not star-rating order. Regression for the
+    # "taiko osu!" label on The Big Black (set 41823).
+    s = _mkset2(41823, title="The Big Black",
+                diffs=[c.Diff("taiko", 5.2, 0, 260, "Ono's Taiko Oni", ""),
+                       c.Diff("osu", 6.8, 0, 500, "WHO'S AFRAID OF THE BIG BLACK", "")])
+    # diffs are unsorted here on purpose; modes must be canonical regardless
+    assert s.modes == ["osu", "taiko"]
+    s2 = _mkset2(2, diffs=[c.Diff("mania", 3.0, 0, 100, "N", ""),
+                           c.Diff("fruits", 2.0, 0, 100, "C", ""),
+                           c.Diff("osu", 1.0, 0, 100, "E", "")])
+    assert s2.modes == ["osu", "fruits", "mania"]

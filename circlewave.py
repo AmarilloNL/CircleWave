@@ -59,6 +59,7 @@ import re
 import sys
 import time
 import random
+import shutil
 import logging
 import tempfile
 import threading
@@ -69,7 +70,7 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, Signal, Slot, QSize, QUrl, QRect,
-    QPoint, QTimer, QSettings, QStringListModel,
+    QPoint, QTimer, QSettings, QStringListModel, QEvent,
 )
 from PySide6.QtGui import (
     QPixmap, QDesktopServices, QFont, QFontMetrics, QIcon, QColor,
@@ -163,12 +164,19 @@ class DownloadSignals(QObject):
 
 
 class DownloadWorker(QRunnable):
-    def __init__(self, s: Beatmapset, dest_dir: str, no_video: bool, mirrors: list):
+    def __init__(self, s: Beatmapset, dest_dir: str, no_video: bool, mirrors: list,
+                 stats=None):
         super().__init__()
         self.s = s
         self.dest_dir = dest_dir
         self.no_video = no_video
+        # Prefer the mirrors that have proven fast + reliable this session, falling
+        # back through the rest in their configured order (see MirrorStats.order).
+        if stats is not None:
+            rank = {m["name"]: i for i, m in enumerate(stats.order([m["name"] for m in mirrors]))}
+            mirrors = sorted(mirrors, key=lambda m: rank.get(m["name"], 0))
         self.mirrors = mirrors
+        self.stats = stats
         self.signals = DownloadSignals()
         # threading.Event, not a bare bool: the flag is set from the GUI thread
         # and read from the worker thread, and Event makes that hand-off explicit.
@@ -176,6 +184,10 @@ class DownloadWorker(QRunnable):
 
     def cancel(self):
         self._cancel.set()
+
+    def _stat(self, name, ok, nbytes=0, secs=0.0):
+        if self.stats is not None:
+            self.stats.record(name, ok, nbytes, secs)
 
     @property
     def cancelled(self) -> bool:      # kept for callers that inspect the flag
@@ -241,6 +253,7 @@ class DownloadWorker(QRunnable):
                     if r.status_code not in (200, 206) or "text/html" in ctype or "json" in ctype:
                         last_err = f"{mirror['name']} HTTP {r.status_code}"
                         self._discard(tmp, meta)      # response body is not an .osz
+                        self._stat(mirror["name"], False)
                         continue
 
                     if r.status_code == 206 and resume_from:
@@ -278,15 +291,19 @@ class DownloadWorker(QRunnable):
                     if got < 1024 or not self._looks_like_zip(tmp):
                         last_err = f"{mirror['name']} returned an invalid/partial file"
                         self._discard(tmp, meta)
+                        self._stat(mirror["name"], False)
                         continue
                     tmp.replace(dest)
                     self._discard(meta)
+                    self._stat(mirror["name"], True,
+                               got - start_got, max(0.0, time.monotonic() - start_t))
                     self.signals.done.emit(sid, str(dest))
                     return
             except Exception as e:  # noqa: BLE001
                 # Network hiccup: keep the partial so the same mirror can resume.
                 log.warning("download %s via %s failed: %s", sid, mirror["name"], e)
                 last_err = f"{mirror['name']}: {e}"
+                self._stat(mirror["name"], False)
                 continue
 
         self.signals.failed.emit(sid, last_err)
@@ -529,6 +546,13 @@ class BeatmapCard(QFrame):
         root.addLayout(btns)
         self.set_downloaded(downloaded)
 
+    def set_focused(self, on: bool):
+        """Keyboard-navigation focus ring (a glow), toggled by the grid navigator."""
+        if on:
+            apply_glow(self, radius=20, alpha=220)
+        else:
+            self.setGraphicsEffect(None)
+
     def _fill_text(self, s: Beatmapset):
         """Populate title / artist / stats / sub from a set. For a pack card with
         no metadata yet, stats is blank and sub shows the pack hint."""
@@ -661,6 +685,183 @@ class BeatmapCard(QFrame):
         return QSize(self.CARD_W, self.CARD_H)
 
 
+class CompactCard(QFrame):
+    """A slim one-line list row -- the compact/dense view alternative to the
+    hero-cover BeatmapCard. Same signals and public interface, so MainWindow and
+    the FlowLayout treat the two interchangeably. Its large minimum width makes
+    the FlowLayout place exactly one per row."""
+
+    MIN_W = 620
+    ROW_H = 58
+
+    previewRequested = Signal(int)
+    downloadRequested = Signal(object)
+    detailsRequested = Signal(object)
+    selectionToggled = Signal(object, bool)
+
+    def __init__(self, s: Beatmapset, downloaded: bool):
+        super().__init__()
+        self.s = s
+        self.compact = True
+        self._in_pack = s.minimal
+        self._raw_title = s.title
+        self._raw_stats = ""
+        self._cover_pix = None
+        self.setObjectName("card")
+        self.setProperty("compact", True)
+        self.setFixedHeight(self.ROW_H)
+        self.setMinimumWidth(self.MIN_W)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(13, 6, 12, 6)
+        root.setSpacing(10)
+
+        self.select_btn = QToolButton()
+        self.select_btn.setObjectName("selbtn")
+        self.select_btn.setCheckable(True)
+        self.select_btn.setText("➕")          # heavy plus; ✓ when checked
+        self.select_btn.setToolTip("Select for bulk actions (download / build a collection)")
+        self.select_btn.setCursor(Qt.PointingHandCursor)
+        self.select_btn.toggled.connect(self._on_select_toggled)
+        root.addWidget(self.select_btn)
+
+        mid = QVBoxLayout()
+        mid.setContentsMargins(0, 0, 0, 0)
+        mid.setSpacing(1)
+        mid.addStretch(1)
+        self.title_lbl = QLabel(); self.title_lbl.setObjectName("title")
+        self.stats_lbl = QLabel(); self.stats_lbl.setObjectName("stats")
+        mid.addWidget(self.title_lbl)
+        mid.addWidget(self.stats_lbl)
+        mid.addStretch(1)
+        root.addLayout(mid, 1)
+
+        # cover/artist/sub labels exist but stay hidden -- lets set_cover /
+        # _refresh_badges / _fill_text from the shared code path be no-op-safe.
+        self.cover = QLabel(self); self.cover.hide()
+        self.artist_lbl = QLabel(self); self.artist_lbl.hide()
+        self.sub_lbl = QLabel(self); self.sub_lbl.hide()
+
+        self.preview_btn = QToolButton()
+        self.preview_btn.setText("▶")
+        self.preview_btn.setToolTip("Preview audio")
+        self.preview_btn.setObjectName("circbtn")
+        self.preview_btn.clicked.connect(lambda: self.previewRequested.emit(s.id))
+        root.addWidget(self.preview_btn)
+
+        self.dl_btn = QPushButton("Download")
+        self.dl_btn.setObjectName("dlbtn")
+        self.dl_btn.setFixedWidth(122)
+        self.dl_btn.clicked.connect(lambda: self.downloadRequested.emit(self.s))
+        root.addWidget(self.dl_btn)
+
+        self.info_btn = QToolButton()
+        self.info_btn.setText("ⓘ")
+        self.info_btn.setToolTip("Details — all difficulties, more by this mapper/artist")
+        self.info_btn.setObjectName("circbtn")
+        self.info_btn.clicked.connect(lambda: self.detailsRequested.emit(self.s))
+        root.addWidget(self.info_btn)
+
+        web_btn = QToolButton()
+        web_btn.setText("↗")
+        web_btn.setToolTip("Open on osu! website")
+        web_btn.setObjectName("circbtn")
+        web_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(WEB_SET_URL.format(id=s.id))))
+        root.addWidget(web_btn)
+
+        self._fill_text(s)
+        self.set_downloaded(downloaded)
+
+    # --- text -------------------------------------------------------------
+    def _fill_text(self, s: Beatmapset):
+        self._raw_title = s.title
+        parts = []
+        lo, hi = s.sr_range
+        if hi > 0:
+            parts.append(f"★ {lo:.1f}" if abs(hi - lo) < 0.05
+                         else f"★ {lo:.1f}–{hi:.1f}")
+        if s.status:
+            parts.append(s.status)
+        if s.artist:
+            parts.append(s.artist)
+        if s.length:
+            parts.append(fmt_len(s.length))
+        if s.bpm:
+            parts.append(f"{int(s.bpm)} BPM")
+        modes = " ".join(MODE_NAME.get(m, m) for m in s.modes)
+        if modes:
+            parts.append(modes)
+        if s.creator:
+            parts.append(f"by {s.creator}")
+        self._raw_stats = "   ·   ".join(parts)
+        self._reelide()
+
+    def _reelide(self):
+        avail = max(120, self.width() - 320)
+        self.title_lbl.setText(elide(self._raw_title, avail, bold=True, px=15))
+        self.title_lbl.setToolTip(f"{self.s.artist} - {self.s.title}" if self.s.artist else self.s.title)
+        self.stats_lbl.setText(elide(self._raw_stats, avail, px=12))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reelide()
+
+    # --- interface parity with BeatmapCard --------------------------------
+    def _on_select_toggled(self, checked: bool):
+        self.select_btn.setText("✓" if checked else "➕")
+        self.selectionToggled.emit(self.s, checked)
+
+    def set_selected(self, yes: bool):
+        self.select_btn.blockSignals(True)
+        self.select_btn.setChecked(yes)
+        self.select_btn.setText("✓" if yes else "➕")
+        self.select_btn.blockSignals(False)
+
+    def set_focused(self, on: bool):
+        if on:
+            apply_glow(self, radius=16, alpha=200)
+        else:
+            self.setGraphicsEffect(None)
+
+    def set_downloaded(self, yes: bool):
+        self.dl_btn.setEnabled(True)
+        self.dl_btn.setText("✓ In library" if yes else "Download")
+        self.setProperty("owned", yes)
+        for w in (self, self.dl_btn):
+            w.style().unpolish(w)
+            w.style().polish(w)
+
+    def mark_queued(self):
+        self.dl_btn.setEnabled(False); self.dl_btn.setText("Queued…")
+
+    def mark_downloading(self):
+        self.dl_btn.setEnabled(False); self.dl_btn.setText("Downloading…")
+
+    def mark_failed(self):
+        self.dl_btn.setEnabled(True); self.dl_btn.setText("Retry")
+
+    def set_preview_playing(self, playing: bool):
+        self.preview_btn.setText("❚❚" if playing else "▶")
+
+    def set_cover(self, data: bytes):
+        pass                                   # compact rows show no cover art
+
+    def _refresh_badges(self):
+        self._fill_text(self.s)                # star range lives in the text line
+
+    def apply_full(self, full: Beatmapset):
+        self.s = full
+        self._in_pack = True
+        self._fill_text(full)
+
+    def sizeHint(self):
+        return QSize(self.MIN_W, self.ROW_H)
+
+    def minimumSizeHint(self):
+        return QSize(self.MIN_W, self.ROW_H)
+
+
 def elide(text: str, width: int, bold: bool = False, px: int = 0) -> str:
     f = QFont()
     f.setBold(bold)
@@ -691,6 +892,7 @@ class FilterBar(QWidget):
     beatmapPacksRequested = Signal()
     mostPlayedRequested = Signal()
     randomRequested = Signal()
+    viewToggleRequested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -722,6 +924,12 @@ class FilterBar(QWidget):
         self.query = QLineEdit()
         self.query.setObjectName("search")
         self.query.setPlaceholderText("Search title, artist, mapper, tags\u2026   (leave empty for the A\u2013Z catalog)")
+        self.query.setToolTip(
+            "Inline operators work too:\n"
+            "   star>6   bpm<200   length>120\n"
+            "   mode=mania   status=loved\n"
+            "   artist=camellia   title=\u2026   mapper=\u2026\n"
+            "e.g.  camellia star>6 mode=mania")
         self.query.returnPressed.connect(self.searchRequested.emit)
         apply_glow(self.query, radius=16, alpha=70)
         row1.addWidget(self.query, 1)
@@ -764,6 +972,14 @@ class FilterBar(QWidget):
         self.presets_btn.setToolTip("Saved filter presets")
         self.presets_btn.setPopupMode(QToolButton.InstantPopup)
         row1.addWidget(self.presets_btn)
+
+        # View toggle: hero-cover grid ⇄ dense one-line list (Ctrl+L).
+        self.view_btn = QToolButton()
+        self.view_btn.setText("▤")
+        self.view_btn.setObjectName("medalbtn")
+        self.view_btn.setToolTip("Toggle list / card view  (Ctrl+L)")
+        self.view_btn.clicked.connect(self.viewToggleRequested.emit)
+        row1.addWidget(self.view_btn)
         outer.addLayout(row1)
 
         # filters live in a distinct surface panel so they read as real controls
@@ -975,6 +1191,12 @@ class DownloadRow(QFrame):
         self.status.setText("\u2713 done")
         self.status.setStyleSheet("color:#7ac74f;")
         self._hide_cancel()
+
+    def set_warn(self, msg: str):
+        """Downloaded but a checksum didn't match -- amber, with detail on hover."""
+        self.status.setText("⚠ check")
+        self.status.setStyleSheet("color:#ffb454;")
+        self.setToolTip(msg)
 
     def set_failed(self, err: str):
         self.bar.setRange(0, 100)
@@ -1272,15 +1494,16 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.settings = settings
         self.setWindowTitle("Settings")
-        self.setMinimumSize(680, 500)
-        self.resize(700, 520)
+        self.setMinimumSize(700, 620)
+        self.resize(720, 660)
         form = QFormLayout(self)
-        form.setContentsMargins(22, 20, 22, 20)
-        form.setVerticalSpacing(16)
-        form.setHorizontalSpacing(16)
+        form.setContentsMargins(26, 24, 26, 22)
+        form.setVerticalSpacing(20)
+        form.setHorizontalSpacing(18)
         form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        self._form = form
 
         # single folder: downloads land here AND it's scanned for "already have".
         # Defaults to the auto-detected osu! Songs folder.
@@ -1354,6 +1577,14 @@ class SettingsDialog(QDialog):
         cs_row.addWidget(test_btn)
         form.addRow("osu! API client secret", self._wrap(cs_row))
 
+        # Uniform, roomier field height so nothing reads as squished; buttons in
+        # the inline rows stretch to match.
+        for w in (self.songs_dir, self.collection_db, self.osu_db, self.concurrency,
+                  self.accent, self.client_id, self.client_secret):
+            w.setMinimumHeight(34)
+        for b in self.findChildren(QPushButton):
+            b.setMinimumHeight(34)
+
         hint = QLabel("Maps download into the Songs folder, which is also scanned to mark what "
                       "you already have (auto-detects osu-wine / lazer / Windows / macOS).\n\n"
                       "collection.db is your osu!stable collection file (usually in the osu! root, "
@@ -1361,6 +1592,7 @@ class SettingsDialog(QDialog):
                       "Leave blank if you don't use it.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
+        hint.setContentsMargins(0, 10, 0, 4)
         form.addRow(hint)
 
         bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -1369,6 +1601,11 @@ class SettingsDialog(QDialog):
         form.addRow(bb)
 
     def _wrap(self, layout):
+        # Zero the inner margins and use a consistent gap so these button-rows line
+        # up flush with the plain-field rows (otherwise the default 9px layout
+        # margin makes them taller and the form rhythm looks uneven).
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
         w = QWidget()
         w.setLayout(layout)
         return w
@@ -1461,6 +1698,7 @@ class CollectionManagerDialog(QDialog):
     def __init__(self, db_path: Path, songs_dir: str, parent=None):
         super().__init__(parent)
         self.db_path = Path(db_path)
+        self.songs_dir = songs_dir
         self.setWindowTitle("Collection manager")
         self.resize(460, 560)
 
@@ -1499,6 +1737,22 @@ class CollectionManagerDialog(QDialog):
         close.clicked.connect(self.accept)
         btns.addWidget(close)
         lay.addLayout(btns)
+
+        tools = QHBoxLayout()
+        tools.setSpacing(8)
+        for text, slot, tip in [
+                ("Stats", self._stats, "Installed/missing + mode breakdown of the selected collection"),
+                ("Diff…", self._diff, "Compare two selected collections"),
+                ("Cleanup…", self._cleanup, "Find empty, redundant, or orphaned collections"),
+                ("osu!Collector…", self._import_osucollector,
+                 "Import a collection from an osu!Collector URL or id")]:
+            b = QPushButton(text)
+            b.setObjectName("smallbtn")
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
+            tools.addWidget(b)
+        tools.addStretch(1)
+        lay.addLayout(tools)
 
         note = QLabel("Close osu! before editing, then reopen (press F5 in song "
                       "select if a change doesn't show). A .bak backup is kept.")
@@ -1634,6 +1888,194 @@ class CollectionManagerDialog(QDialog):
                                 "Nothing to import from that file.")
         self._reload()
 
+    def _import_osucollector(self):
+        text, ok = QInputDialog.getText(
+            self, "Import from osu!Collector",
+            "Paste an osu!Collector URL or collection id:")
+        if not ok or not (text or "").strip():
+            return
+        cid = parse_osucollector_ref(text)
+        if cid is None:
+            QMessageBox.information(
+                self, "osu!Collector",
+                "That doesn't look like an osu!Collector link or id.\n"
+                "Example: https://osucollector.com/collections/1234")
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            data = fetch_osucollector(cid)
+            n = import_collections_into_db(self.db_path, data)
+        except Exception as e:  # noqa: BLE001
+            QApplication.restoreOverrideCursor()
+            log.exception("osu!Collector import failed")
+            QMessageBox.critical(self, "osu!Collector", f"Couldn't import:\n{e}")
+            return
+        QApplication.restoreOverrideCursor()
+        got = data.get("collections") or []
+        maps = sum(len(c.get("hashes", [])) for c in got)
+        QMessageBox.information(
+            self, "osu!Collector",
+            f"Imported {n} collection(s) ({maps} maps merged)." if n else
+            "That collection had no importable maps.")
+        self._reload()
+
+    def _osu_db_beatmaps(self):
+        """Parse osu!.db for stats/orphan checks; returns [] on any failure."""
+        try:
+            return read_osu_db(default_osu_db_path(self.songs_dir))["beatmaps"]
+        except Exception as e:  # noqa: BLE001
+            log.info("osu!.db read for collection tools failed: %s", e)
+            return []
+
+    def _hashes_for(self, name):
+        return dict(read_collection_db(self.db_path)[1]).get(name, [])
+
+    def _stats(self):
+        if not self._guard():
+            return
+        names = self._selected_names()
+        if len(names) != 1:
+            QMessageBox.information(self, "Stats", "Select exactly one collection.")
+            return
+        beatmaps = self._osu_db_beatmaps()
+        if not beatmaps:
+            QMessageBox.information(
+                self, "Stats", "Couldn't read osu!.db, so installed/missing counts "
+                "aren't available. Set the osu!.db path in Settings.")
+            return
+        st = collection_stats(self._hashes_for(names[0]), beatmaps)
+        mode_names = {"osu": "osu!", "taiko": "Taiko", "fruits": "Catch", "mania": "Mania"}
+        modes = "\n".join(f"   • {mode_names.get(k, k)}: {v}"
+                          for k, v in sorted(st["by_mode"].items())) or "   (none installed)"
+        QMessageBox.information(
+            self, f"Stats — {names[0]}",
+            f"{st['total']} maps in this collection\n"
+            f"{st['installed']} installed · {st['missing']} missing\n\n"
+            f"Installed by mode:\n{modes}")
+
+    def _diff(self):
+        if not self._guard():
+            return
+        names = self._selected_names()
+        if len(names) != 2:
+            QMessageBox.information(self, "Diff", "Select exactly two collections to compare.")
+            return
+        a, b = names
+        d = diff_collections(self._hashes_for(a), self._hashes_for(b))
+        QMessageBox.information(
+            self, "Diff",
+            f"Comparing “{a}” → “{b}”:\n\n"
+            f"   {len(d['common'])} maps in both\n"
+            f"   {len(d['added'])} only in “{b}”\n"
+            f"   {len(d['removed'])} only in “{a}”")
+
+    def _cleanup(self):
+        if not self._guard():
+            return
+        cols = read_collection_db(self.db_path)[1]
+        empties = find_empty_collections(cols)
+        subsets = find_subset_collections(cols)
+        beatmaps = self._osu_db_beatmaps()
+        orphan_note = ""
+        if beatmaps:
+            known = {b["md5"] for b in beatmaps if b.get("md5")}
+            orphans = find_orphan_hashes(cols, known)
+            if orphans:
+                orphan_note = "\n\nCollections referencing maps not in osu!.db:\n" + \
+                    "\n".join(f"   • {n}: {len(h)} missing" for n, h in orphans.items())
+        report = []
+        if empties:
+            report.append("Empty collections:\n" + "\n".join(f"   • {n}" for n in empties))
+        if subsets:
+            report.append("Redundant (fully inside another):\n" +
+                          "\n".join(f"   • “{a}” ⊆ “{b}”" for a, b in subsets))
+        body = "\n\n".join(report) + orphan_note
+        if not body.strip():
+            QMessageBox.information(self, "Cleanup", "Nothing to clean up — collections look tidy.")
+            return
+        if empties:
+            if QMessageBox.question(
+                    self, "Cleanup",
+                    body + "\n\nDelete the empty collection(s) now?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+                for n in empties:
+                    delete_collection(self.db_path, n)
+                self._reload()
+        else:
+            QMessageBox.information(self, "Cleanup", body)
+
+
+# ----------------------------------------------------------------------------
+# COMMAND PALETTE
+# ----------------------------------------------------------------------------
+class CommandPalette(QDialog):
+    """Fuzzy-filterable list of app actions (Ctrl+K). Type to narrow, Enter to run.
+
+    `actions` is a list of (label, callable). Matching uses the same fuzzy scorer
+    as search, with a substring bias, so short queries still land the right item."""
+
+    def __init__(self, actions, parent=None):
+        super().__init__(parent)
+        self.actions = actions
+        self.setWindowTitle("Command palette")
+        self.setModal(True)
+        self.resize(420, 380)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+
+        self.box = QLineEdit()
+        self.box.setObjectName("search")
+        self.box.setPlaceholderText("Type a command…")
+        self.box.textChanged.connect(self._refilter)
+        self.box.returnPressed.connect(self._run_current)
+        lay.addWidget(self.box)
+
+        self.list = QListWidget()
+        self.list.itemActivated.connect(lambda _it: self._run_current())
+        lay.addWidget(self.list, 1)
+
+        # Up/Down move the selection while focus stays in the text box.
+        self.box.installEventFilter(self)
+        self._refilter("")
+
+    def _refilter(self, text):
+        self.list.clear()
+        q = (text or "").strip()
+        if not q:
+            items = list(self.actions)
+        else:
+            scored = [(fuzzy_score(q, label), label, fn) for label, fn in self.actions]
+            scored = [t for t in scored if t[0] >= 0.3 or q.lower() in t[1].lower()]
+            scored.sort(key=lambda t: t[0], reverse=True)
+            items = [(label, fn) for _, label, fn in scored]
+        for label, fn in items:
+            it = QListWidgetItem(label)
+            it.setData(Qt.UserRole, fn)
+            self.list.addItem(it)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.box and ev.type() == QEvent.KeyPress:
+            key = ev.key()
+            if key in (Qt.Key_Down, Qt.Key_Up):
+                row = self.list.currentRow()
+                row += 1 if key == Qt.Key_Down else -1
+                if 0 <= row < self.list.count():
+                    self.list.setCurrentRow(row)
+                return True
+        return super().eventFilter(obj, ev)
+
+    def _run_current(self):
+        it = self.list.currentItem()
+        if it is None:
+            return
+        fn = it.data(Qt.UserRole)
+        self.accept()
+        if callable(fn):
+            fn()
+
 
 # ----------------------------------------------------------------------------
 # BEATMAP DETAIL PANEL
@@ -1766,13 +2208,17 @@ class MainWindow(QMainWindow):
         self.more = True
         self.loading = False
         self.cur_filters = None
-        self.cards = {}            # setid -> BeatmapCard
+        self.cards = {}            # setid -> BeatmapCard / CompactCard
+        self._focus_id = None      # setid of the keyboard-focused card, if any
+        self.view_mode = self.settings.value("view_mode", "cards")   # "cards" | "list"
         self._cover_requested = set()   # setids whose cover load has started (lazy)
         self._bpm_requested = set()     # hinamizawa setids whose BPM enrich started
         self.dl_rows = {}          # setid -> DownloadRow
         self.dl_workers = {}       # setid -> active DownloadWorker
         self.dl_pending = []       # list[Beatmapset] waiting for a free slot
         self.dl_failed = {}        # setid -> Beatmapset for failed (retryable) items
+        self.mirror_stats = MirrorStats()   # per-mirror speed/reliability this session
+        self._pending_update = None         # newer release info, if the check found one
         self.selected = {}         # setid -> Beatmapset picked for bulk actions
         self.dl_paused = False
         self.dl_concurrency = int(self.settings.value("concurrency", 3))
@@ -1785,6 +2231,7 @@ class MainWindow(QMainWindow):
         self.history_path = cfg_dir / "download_history.json"
         self.history_ids = load_history(self.history_path)
         self.queue_path = cfg_dir / "download_queue.json"
+        self.search_cache_dir = cfg_dir / "cache"   # offline first-page search cache
 
         self._build_ui()
         self._setup_audio()
@@ -1794,6 +2241,23 @@ class MainWindow(QMainWindow):
         self._refresh_downloaded()
         self._restore_queue()
         QTimer.singleShot(0, self.new_search)  # initial A-Z-ish load
+        if self.settings.value("check_app_update", "true") != "false":
+            QTimer.singleShot(1500, self._check_app_update)   # quiet startup check
+
+    def _check_app_update(self):
+        """Background check for a newer CircleWave release; a hit shows a
+        non-intrusive status note (never a modal on startup)."""
+        w = Worker(check_for_app_update, APP_VERSION)
+        w.signals.result.connect(self._on_app_update)
+        self.pool.start(w)
+
+    def _on_app_update(self, rel):
+        if not rel:
+            return
+        self._pending_update = rel
+        self.status_label.setText(
+            f"A newer CircleWave is available ({rel['tag']}). "
+            "Open the command palette (Ctrl+K) → “Get the latest release”.")
 
     # -- UI -----------------------------------------------------------------
     def _build_ui(self):
@@ -1813,6 +2277,7 @@ class MainWindow(QMainWindow):
         self.filter_bar.beatmapPacksRequested.connect(self._open_beatmap_packs)
         self.filter_bar.mostPlayedRequested.connect(self._open_most_played)
         self.filter_bar.randomRequested.connect(self._open_random)
+        self.filter_bar.viewToggleRequested.connect(self.toggle_view_mode)
         root.addWidget(self.filter_bar)
         self._setup_search_history()
         self._rebuild_presets_menu()
@@ -1981,12 +2446,38 @@ class MainWindow(QMainWindow):
     def _setup_audio(self):
         self.player = None
         self.now_playing = None
+        self.autoplay = self.settings.value("autoplay", "false") == "true"
         if HAS_MULTIMEDIA:
             self.player = QMediaPlayer()
             self.audio_out = QAudioOutput()
             self.audio_out.setVolume(int(self.settings.value("volume", 40)) / 100)
             self.player.setAudioOutput(self.audio_out)
             self.player.playbackStateChanged.connect(self._on_playback_change)
+            # Auto-advance: when a clip ends naturally, play the next card's preview.
+            self.player.mediaStatusChanged.connect(self._on_media_status)
+
+    def toggle_autoplay(self):
+        self.autoplay = not self.autoplay
+        self.settings.setValue("autoplay", "true" if self.autoplay else "false")
+        self.status_label.setText(
+            "Auto-play previews: on — clips advance to the next card."
+            if self.autoplay else "Auto-play previews: off.")
+
+    def _on_media_status(self, status):
+        # EndOfMedia fires only on a natural finish (not a user stop), so this
+        # advances the radio-style preview without hijacking a manual stop.
+        if status == QMediaPlayer.EndOfMedia and self.autoplay:
+            nxt = self._adjacent_card_id(self.now_playing, +1)
+            if nxt is not None:
+                self.preview(nxt)
+
+    def _adjacent_card_id(self, setid, step):
+        """The set id `step` positions from `setid` in on-screen order, or None."""
+        order = list(self.cards.keys())
+        if setid not in order:
+            return None
+        i = order.index(setid) + step
+        return order[i] if 0 <= i < len(order) else None
 
     def _set_volume(self, v):
         self.settings.setValue("volume", v)
@@ -2034,7 +2525,131 @@ class MainWindow(QMainWindow):
         sc("Ctrl+D", self.download_all_shown)
         sc("Ctrl+Shift+C", self._open_collections)
         sc("Ctrl+,", self._open_settings)
+        sc("Ctrl+K", self._open_command_palette)
+        sc("Ctrl+L", self.toggle_view_mode)
         sc("Escape", self.stop_preview)
+
+        # Grid navigation -- scoped to the results area (WidgetWithChildren), so
+        # these never fire while the search box or a combo has focus.
+        def gsc(seq, fn):
+            s = QShortcut(QKeySequence(seq), self.scroll)
+            s.setContext(Qt.WidgetWithChildrenShortcut)
+            s.activated.connect(fn)
+        gsc("Left", lambda: self._move_focus(-1, 0))
+        gsc("Right", lambda: self._move_focus(1, 0))
+        gsc("Up", lambda: self._move_focus(0, -1))
+        gsc("Down", lambda: self._move_focus(0, 1))
+        gsc("Return", self._activate_focused)
+        gsc("Enter", self._activate_focused)
+        gsc("P", self._preview_focused)
+        gsc("D", self._download_focused)
+        gsc("X", self._toggle_select_focused)
+
+    # -- keyboard grid navigation -------------------------------------------
+    def _focus_card(self, setid):
+        prev = getattr(self, "_focus_id", None)
+        if prev in self.cards and prev != setid:
+            self.cards[prev].set_focused(False)
+        self._focus_id = setid
+        card = self.cards.get(setid)
+        if card:
+            card.set_focused(True)
+            self.scroll.ensureWidgetVisible(card, 40, 40)
+
+    def _move_focus(self, dx, dy):
+        if not self.cards:
+            return
+        cur = self.cards.get(getattr(self, "_focus_id", None))
+        if cur is None:                       # first press: grab the first card
+            self._focus_card(next(iter(self.cards)))
+            return
+        c = cur.geometry().center()
+        best, best_score = None, None
+        for sid, card in self.cards.items():
+            if card is cur:
+                continue
+            p = card.geometry().center()
+            ddx, ddy = p.x() - c.x(), p.y() - c.y()
+            if (dx > 0 and ddx <= 0) or (dx < 0 and ddx >= 0):
+                continue
+            if (dy > 0 and ddy <= 0) or (dy < 0 and ddy >= 0):
+                continue
+            # distance along the travel axis, heavily penalising cross-axis drift
+            score = (abs(ddx) + 3 * abs(ddy)) if dx else (abs(ddy) + 3 * abs(ddx))
+            if best_score is None or score < best_score:
+                best, best_score = sid, score
+        if best is not None:
+            self._focus_card(best)
+
+    def toggle_view_mode(self):
+        """Flip between the hero-cover grid and the dense one-line list, re-rendering
+        the current results in place (selection + owned state preserved)."""
+        self.view_mode = "list" if self.view_mode == "cards" else "cards"
+        self.settings.setValue("view_mode", self.view_mode)
+        sets = [c.s for c in self.cards.values()]
+        # rebuild the grid with the same sets under the new widget class
+        while self.flow.count():
+            it = self.flow.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+        self.cards.clear()
+        self._focus_id = None
+        self._cover_requested.clear()
+        for s in sets:
+            self._add_card(s, s.id in self.downloaded_ids)
+        self.status_label.setText(
+            f"View: {'list' if self.view_mode == 'list' else 'cards'} — {len(sets)} shown")
+
+    def _focused_card(self):
+        return self.cards.get(getattr(self, "_focus_id", None))
+
+    def _activate_focused(self):
+        card = self._focused_card()
+        if card:
+            self._open_details(card.s)
+
+    def _preview_focused(self):
+        card = self._focused_card()
+        if card:
+            self.preview(card.s.id)
+
+    def _download_focused(self):
+        card = self._focused_card()
+        if card:
+            self.enqueue_download(card.s)
+
+    def _toggle_select_focused(self):
+        card = self._focused_card()
+        if card:
+            card.select_btn.toggle()
+
+    def _open_command_palette(self):
+        actions = [
+            ("Search", self._focus_search),
+            ("Refresh search (F5)", self.new_search),
+            ("Random map", self._open_random),
+            ("Medal packs", self._open_medal_packs),
+            ("Beatmap packs", self._open_beatmap_packs),
+            ("Most played", self._open_most_played),
+            ("Toggle list / card view", self.toggle_view_mode),
+            ("Download all shown", self.download_all_shown),
+            ("Toggle auto-play previews", self.toggle_autoplay),
+            ("Pause / resume queue", self.toggle_pause),
+            ("Retry failed downloads", self.retry_failed),
+            ("Cancel all downloads", self.cancel_all),
+            ("Collection manager", self._open_collections),
+            ("Build collection from shown results", self._collection_from_shown),
+            ("Check for updates", self._check_updates),
+            ("Get the latest CircleWave release", self._open_latest_release),
+            ("Settings", self._open_settings),
+        ]
+        CommandPalette(actions, self).exec()
+
+    def _open_latest_release(self):
+        rel = self._pending_update
+        url = (rel or {}).get("url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
+        QDesktopServices.openUrl(QUrl(url))
 
     def _focus_search(self):
         self.filter_bar.query.setFocus()
@@ -2059,11 +2674,13 @@ class MainWindow(QMainWindow):
             if w:
                 w.deleteLater()
         self.cards.clear()
+        self._focus_id = None
         self._cover_requested.clear()
         self._bpm_requested.clear()
 
     def _add_card(self, s, owned):
-        card = BeatmapCard(s, owned)
+        cls = CompactCard if self.view_mode == "list" else BeatmapCard
+        card = cls(s, owned)
         card.previewRequested.connect(self.preview)
         card.downloadRequested.connect(self.enqueue_download)
         card.detailsRequested.connect(self._open_details)
@@ -2133,9 +2750,16 @@ class MainWindow(QMainWindow):
         self._build_collection_from_selection(db_path, name)
 
     def _build_collection_from_selection(self, db_path, name):
-        """Gather each selected set's diff checksums (fetching where a set has none)
-        in a worker, then merge them into the named collection."""
-        sets = list(self.selected.values())
+        self._build_collection_from_sets(db_path, name, list(self.selected.values()),
+                                         offer_download=self._selection_download)
+
+    def _build_collection_from_sets(self, db_path, name, sets, offer_download=None):
+        """Gather each set's diff checksums (fetching where a set has none) in a
+        worker, then merge them into the named collection. Shared by the multi-
+        select builder and the 'collection from shown results' action."""
+        if not sets:
+            self.status_label.setText("Nothing to build a collection from.")
+            return
         self.status_label.setText(f"Gathering {len(sets)} map(s) for “{name}”…")
 
         def job():
@@ -2146,17 +2770,36 @@ class MainWindow(QMainWindow):
             return upsert_collection(db_path, name, merged)
 
         w = Worker(job)
-        w.signals.result.connect(lambda status: self._on_selection_collection_done(name, db_path, status))
+        w.signals.result.connect(
+            lambda status: self._on_collection_built(name, db_path, status, offer_download))
         w.signals.error.connect(lambda e: self.status_label.setText(f"Collection failed: {e}"))
         self.pool.start(w)
 
-    def _on_selection_collection_done(self, name, db_path, status):
+    def _on_collection_built(self, name, db_path, status, offer_download):
         self.status_label.setText(f"{status} — written to {db_path}")
-        if QMessageBox.question(
+        if offer_download and QMessageBox.question(
                 self, "Collection built",
                 f"{status}.\n\nAlso download these maps now?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
-            self._selection_download()
+            offer_download()
+
+    def _collection_from_shown(self):
+        """Turn the current search results into a collection (a lightweight 'smart
+        collection': whatever this search matched right now)."""
+        if not self.cards:
+            self.status_label.setText("No results to build a collection from.")
+            return
+        db_path = self._collection_db_path(prompt=True)
+        if not db_path:
+            return
+        default = (self.cur_filters or {}).get("q") or "CircleWave search"
+        name, ok = QInputDialog.getText(
+            self, "Collection from results", "Collection name:", text=default)
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        self._build_collection_from_sets(
+            db_path, name, [c.s for c in self.cards.values()], offer_download=None)
 
     def new_search(self):
         # A pasted beatmap link / id jumps straight to that set instead of searching.
@@ -2169,11 +2812,19 @@ class MainWindow(QMainWindow):
         if self.pack:
             self._exit_pack_mode(refresh=False)
         self.cur_filters = self.filter_bar.filters()
+        # Inline query operators (star>6 bpm<200 mode=mania artist=camellia) parsed
+        # from the search box override the equivalent dropdowns for this search.
+        parsed = parse_query(self.cur_filters.get("q", "") or "")
+        for k in ("q", "option", "mode", "sr_min", "sr_max",
+                  "bpm_min", "bpm_max", "len_min", "len_max"):
+            if k in parsed:
+                self.cur_filters[k] = parsed[k]
         self._push_history(self.cur_filters.get("q", ""))
         self.settings.setValue("last_filters", json.dumps(self.cur_filters))
         self.cursor_token = None
         self.more = True
         self.auto_pages = 0
+        self._search_cached = False     # cache only the first page of this search
         self._clear_grid()
         self._refresh_downloaded()
         self._fetch_page()
@@ -2196,6 +2847,11 @@ class MainWindow(QMainWindow):
         self.cursor_token = next_token
         self.more = next_token is not None
         f = self.cur_filters
+
+        # Cache the first page so this exact search opens instantly / works offline.
+        if not getattr(self, "_search_cached", False) and sets:
+            save_search_cache(self.search_cache_dir, f, sets)
+            self._search_cached = True
 
         added = 0
         for s in sets:
@@ -2229,6 +2885,23 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_error(self, msg):
         self.loading = False
+        # Offline fallback: if the network search failed and we've got nothing on
+        # screen, show the last cached page for these filters (up to a day old).
+        if not self.cards:
+            cached = load_search_cache(self.search_cache_dir, self.cur_filters)
+            if cached:
+                for s in cached:
+                    if s.id in self.cards:
+                        continue
+                    owned = s.id in self.downloaded_ids
+                    if self.cur_filters.get("hide_owned") and owned:
+                        continue
+                    self._add_card(s, owned)
+                self.more = False
+                self.status_label.setText(
+                    f"Offline — showing {len(self.cards)} cached result(s). "
+                    "Reconnect and search again to refresh.")
+                return
         self.status_label.setText(f"Error: {msg}")
 
     # -- medal packs --------------------------------------------------------
@@ -2491,7 +3164,8 @@ class MainWindow(QMainWindow):
             y = card.y()
             if y + card.height() >= top - margin and y <= bottom + margin:
                 self._cover_requested.add(sid)
-                self._load_cover(card.s)
+                if self.view_mode != "list":        # list rows show no cover art
+                    self._load_cover(card.s)
                 # hinamizawa cards have no BPM/play counts -> enrich visible ones
                 # from osu.direct. (Pack cards enrich via their own path.)
                 if (sid not in self._bpm_requested and not card._in_pack
@@ -2625,12 +3299,33 @@ class MainWindow(QMainWindow):
         self.dl_empty.setVisible(not self.dl_rows)
 
     def download_all_shown(self):
-        for sid, card in list(self.cards.items()):
-            if sid in self.downloaded_ids or sid in self.dl_workers:
-                continue
-            if any(p.id == sid for p in self.dl_pending):
-                continue
-            self.enqueue_download(card.s)
+        pending_ids = {p.id for p in self.dl_pending}
+        todo = [card.s for sid, card in self.cards.items()
+                if sid not in self.downloaded_ids and sid not in self.dl_workers
+                and sid not in pending_ids]
+        if not todo:
+            return
+        # Size / disk-space guard: for a sizeable batch, estimate the download and
+        # check the destination volume has room before queueing it all.
+        if len(todo) >= 8:
+            est = estimate_download_size(todo)
+            dest = self.settings.value("songs_dir") or str(Path.home() / "osu-beatmaps")
+            free_txt = ""
+            try:
+                free = shutil.disk_usage(Path(dest).parent).free
+                free_txt = f"\nFree space at destination: ~{fmt_size(free)}."
+                if free < est * 1.1:
+                    free_txt += "  ⚠ That may not be enough."
+            except OSError:
+                pass
+            if QMessageBox.question(
+                    self, "Download all shown",
+                    f"Queue {len(todo)} map(s)?\nEstimated download: ~{fmt_size(est)} "
+                    f"(rough).{free_txt}",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) != QMessageBox.Yes:
+                return
+        for s in todo:
+            self.enqueue_download(s)
 
     def _pump(self):
         if self.dl_paused:
@@ -2642,7 +3337,7 @@ class MainWindow(QMainWindow):
     def _start_download(self, s: Beatmapset):
         dest = self.settings.value("songs_dir") or str(Path.home() / "osu-beatmaps")
         no_video = self.filter_bar.no_video.isChecked()   # live, not search-time
-        worker = DownloadWorker(s, dest, no_video, MIRRORS)
+        worker = DownloadWorker(s, dest, no_video, MIRRORS, stats=self.mirror_stats)
         worker.signals.progress.connect(self._on_dl_progress)
         worker.signals.done.connect(self._on_dl_done)
         worker.signals.failed.connect(self._on_dl_failed)
@@ -2700,6 +3395,15 @@ class MainWindow(QMainWindow):
         row = self.dl_rows.get(setid)
         if row:
             row.set_done()
+        worker = self.dl_workers.get(setid)
+        if worker is not None and set_current_checksums(worker.s):
+            # Verify the finished file against the set's authoritative per-diff
+            # md5s off-thread; only surface a warning if a checksum is missing.
+            s = worker.s
+            vw = Worker(verify_osz, path, s)
+            vw.signals.result.connect(
+                lambda res, sid=setid: self._on_verify(sid, res))
+            self.pool.start(vw)
         self.dl_workers.pop(setid, None)
         self.downloaded_ids.add(setid)
         self.history_ids.add(setid)
@@ -2713,6 +3417,16 @@ class MainWindow(QMainWindow):
         self._pump()
         if not self.dl_workers and not self.dl_pending and not self.dl_failed:
             self._notify(APP_TITLE, "All downloads finished.")
+
+    def _on_verify(self, setid, res):
+        """Result of a background verify_osz: warn (don't fail) on a mismatch, so
+        the map is still usable but the user knows to re-download it."""
+        if res.get("ok") is False:
+            row = self.dl_rows.get(setid)
+            n = len(res.get("missing") or [])
+            if row:
+                row.set_warn(f"Checksum mismatch: {n} difficulty file(s) differ "
+                             f"from the mirror's current version — consider re-downloading.")
 
     @Slot(int, str)
     def _on_dl_failed(self, setid, err):
@@ -2967,6 +3681,10 @@ QWidget { background: transparent; }
 QMainWindow > QWidget, QDialog > QWidget {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 ${bg2}, stop:1 ${bg_deep});
 }
+/* ...but text-y controls (QFormLayout row labels, checkboxes) that are direct
+   dialog children must not pick up that backdrop, or each renders in an ugly box. */
+QMainWindow > QLabel, QDialog > QLabel,
+QMainWindow > QCheckBox, QDialog > QCheckBox { background: transparent; }
 
 QScrollArea#results { background: transparent; border: none; }
 QScrollArea { border: none; }
