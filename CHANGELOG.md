@@ -4,6 +4,20 @@ All notable changes to CircleWave are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **osu.direct download mirror** — added `osu.direct` to the mirror fallback
+  chain (using its `/d/{id}` endpoint; the `/api/d/` path rate-limits). More
+  redundancy, especially for graveyard maps.
+
+### Changed
+- **Default mirror order** re-tuned fastest/most-reliable first (catboy,
+  osu.direct, beatconnect, nerinyan, sayobot) based on real throughput tests.
+  Note this is only a *seed*: at download time the queue already reorders mirrors
+  by the speed and reliability it measures per session, since real mirror speed
+  swings a lot per map (CDN cache hit vs cold generate) and rate-limit state.
+
 ## [2.4.0] - 2026-07-12
 
 ### Fixed
