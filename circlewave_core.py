@@ -149,10 +149,20 @@ DOWNLOAD_UA = ("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox
 
 # Download mirrors, tried top-to-bottom. Each entry: name, full url, no-video url.
 # {id} is substituted with the beatmapset id.
+#
+# The order below is a sensible *default* (fastest/most-reliable first), but real
+# per-mirror speed varies a lot by map (CDN cache hit vs cold generate), time of
+# day, and rate-limit state -- so at download time the queue reorders mirrors by
+# the speed/reliability it actually measured this session (see MirrorStats /
+# order_mirrors). The static order just seeds that.
+#
+# osu.direct's plain /d/{id} is the download endpoint; its /api/d/ path rate-limits
+# aggressively (429), so use /d/. chimu.moe and kitsu.moe folded into osu.direct.
 MIRRORS = [
-    {"name": "nerinyan",   "full": "https://api.nerinyan.moe/d/{id}",                      "novideo": "https://api.nerinyan.moe/d/{id}?noVideo=true"},
     {"name": "catboy",     "full": "https://catboy.best/d/{id}",                           "novideo": "https://catboy.best/d/{id}?n=1"},
+    {"name": "osu.direct", "full": "https://osu.direct/d/{id}",                            "novideo": "https://osu.direct/d/{id}?noVideo=1"},
     {"name": "beatconnect","full": "https://beatconnect.io/b/{id}",                        "novideo": None},
+    {"name": "nerinyan",   "full": "https://api.nerinyan.moe/d/{id}",                      "novideo": "https://api.nerinyan.moe/d/{id}?noVideo=true"},
     # Sayobot is China-hosted and slow/throttled from outside CN, so it's the last resort.
     {"name": "sayobot",    "full": "https://dl.sayobot.cn/beatmaps/download/full/{id}",    "novideo": "https://dl.sayobot.cn/beatmaps/download/novideo/{id}"},
 ]
