@@ -83,7 +83,7 @@ from PySide6.QtWidgets import (
     QToolButton, QProgressBar, QDialog, QDialogButtonBox, QFileDialog,
     QMessageBox, QSplitter, QStatusBar, QStyle, QSlider, QGraphicsDropShadowEffect,
     QListWidget, QListWidgetItem, QInputDialog, QAbstractItemView, QMenu,
-    QSystemTrayIcon,
+    QSystemTrayIcon, QPlainTextEdit,
 )
 
 # QtMultimedia is optional (preview audio). Degrade gracefully if codecs missing.
@@ -1140,6 +1140,7 @@ class FilterBar(QWidget):
 # ----------------------------------------------------------------------------
 class DownloadRow(QFrame):
     cancelRequested = Signal(int)
+    moveTopRequested = Signal(int)
 
     def __init__(self, s: Beatmapset):
         super().__init__()
@@ -1154,6 +1155,12 @@ class DownloadRow(QFrame):
         self.name = QLabel(elide(f"{s.artist} - {s.title}", 196, px=12))
         self.name.setObjectName("dlname")
         top.addWidget(self.name, 1)
+        self.top_btn = QToolButton()
+        self.top_btn.setText("\u2b71")            # \u2b71 move to top of queue
+        self.top_btn.setToolTip("Download this next (move to top of the queue)")
+        self.top_btn.setObjectName("xbtn")
+        self.top_btn.clicked.connect(lambda: self.moveTopRequested.emit(self.setid))
+        top.addWidget(self.top_btn)
         self.cancel_btn = QToolButton()
         self.cancel_btn.setText("\u2715")
         self.cancel_btn.setToolTip("Cancel")
@@ -1176,6 +1183,7 @@ class DownloadRow(QFrame):
 
     def _hide_cancel(self):
         self.cancel_btn.hide()
+        self.top_btn.hide()
 
     def set_progress(self, pct: int, status: str):
         if pct < 0:
@@ -1695,12 +1703,14 @@ class CollectionManagerDialog(QDialog):
     """View and edit the collections inside osu!stable's collection.db:
     rename, delete, or merge several into one. Every action backs up first."""
 
-    def __init__(self, db_path: Path, songs_dir: str, parent=None):
+    def __init__(self, db_path: Path, songs_dir: str, osu_db_path="", parent=None):
         super().__init__(parent)
         self.db_path = Path(db_path)
         self.songs_dir = songs_dir
+        self.osu_db_path = osu_db_path      # explicit Settings path (may be blank)
+        self._osu_db_error = ""             # last reason osu!.db couldn't be read
         self.setWindowTitle("Collection manager")
-        self.resize(460, 560)
+        self.resize(540, 580)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 16, 16, 16)
@@ -1745,7 +1755,11 @@ class CollectionManagerDialog(QDialog):
                 ("Diff…", self._diff, "Compare two selected collections"),
                 ("Cleanup…", self._cleanup, "Find empty, redundant, or orphaned collections"),
                 ("osu!Collector…", self._import_osucollector,
-                 "Import a collection from an osu!Collector URL or id")]:
+                 "Import a collection from an osu!Collector URL or id"),
+                ("Export tracklist…", self._export_tracklist,
+                 "Save the selected collection as a readable text tracklist"),
+                ("Download missing…", self._download_missing,
+                 "Queue every map in this collection you don't already have")]:
             b = QPushButton(text)
             b.setObjectName("smallbtn")
             b.setToolTip(tip)
@@ -1920,11 +1934,19 @@ class CollectionManagerDialog(QDialog):
         self._reload()
 
     def _osu_db_beatmaps(self):
-        """Parse osu!.db for stats/orphan checks; returns [] on any failure."""
+        """Parse osu!.db for stats/orphan checks; returns [] on any failure and
+        records a specific reason in self._osu_db_error. Uses the Settings path
+        when set, else the location next to the Songs folder."""
+        self._osu_db_error = ""
+        path = Path(self.osu_db_path) if self.osu_db_path else default_osu_db_path(self.songs_dir)
+        if not path.exists():
+            self._osu_db_error = f"No osu!.db at {path}"
+            return []
         try:
-            return read_osu_db(default_osu_db_path(self.songs_dir))["beatmaps"]
+            return read_osu_db(path)["beatmaps"]
         except Exception as e:  # noqa: BLE001
             log.info("osu!.db read for collection tools failed: %s", e)
+            self._osu_db_error = f"Couldn't parse {path} ({e})"
             return []
 
     def _hashes_for(self, name):
@@ -1940,8 +1962,10 @@ class CollectionManagerDialog(QDialog):
         beatmaps = self._osu_db_beatmaps()
         if not beatmaps:
             QMessageBox.information(
-                self, "Stats", "Couldn't read osu!.db, so installed/missing counts "
-                "aren't available. Set the osu!.db path in Settings.")
+                self, "Stats",
+                "Installed/missing counts need osu!.db.\n\n" + self._osu_db_error +
+                "\n\nSet the osu!.db path in Settings (it's in your osu!stable "
+                "root, next to the Songs folder), or use Auto-detect there.")
             return
         st = collection_stats(self._hashes_for(names[0]), beatmaps)
         mode_names = {"osu": "osu!", "taiko": "Taiko", "fruits": "Catch", "mania": "Mania"}
@@ -1952,6 +1976,64 @@ class CollectionManagerDialog(QDialog):
             f"{st['total']} maps in this collection\n"
             f"{st['installed']} installed · {st['missing']} missing\n\n"
             f"Installed by mode:\n{modes}")
+
+    def _export_tracklist(self):
+        if not self._guard():
+            return
+        names = self._selected_names()
+        if len(names) != 1:
+            QMessageBox.information(self, "Export tracklist", "Select exactly one collection.")
+            return
+        beatmaps = self._osu_db_beatmaps()
+        lines = collection_tracklist(self._hashes_for(names[0]), beatmaps)
+        text = format_tracklist(names[0], lines)
+        if not beatmaps:
+            text += ("\n(Names need osu!.db — set its path in Settings to resolve "
+                     "titles; only md5 hashes are shown for now.)\n")
+        f, _ = QFileDialog.getSaveFileName(
+            self, "Export tracklist", f"{sanitize_filename(names[0])}.txt",
+            "Text file (*.txt);;All files (*)")
+        if not f:
+            return
+        try:
+            Path(f).write_text(text, encoding="utf-8")
+        except OSError as e:
+            QMessageBox.critical(self, "Export tracklist", f"Couldn't write:\n{e}")
+            return
+        QMessageBox.information(self, "Export tracklist",
+                                f"Saved {len(lines)} maps to\n{f}")
+
+    def _download_missing(self):
+        if not self._guard():
+            return
+        names = self._selected_names()
+        if len(names) != 1:
+            QMessageBox.information(self, "Download missing", "Select exactly one collection.")
+            return
+        beatmaps = self._osu_db_beatmaps()
+        if not beatmaps:
+            QMessageBox.information(
+                self, "Download missing",
+                "This needs osu!.db to know what you already have.\n\n"
+                + self._osu_db_error)
+            return
+        known = {b["md5"] for b in beatmaps if b.get("md5")}
+        missing = missing_hashes(self._hashes_for(names[0]), known)
+        if not missing:
+            QMessageBox.information(self, "Download missing",
+                                    f"“{names[0]}” is fully installed — nothing to download.")
+            return
+        main = self.parent()
+        if not hasattr(main, "_download_missing_maps"):
+            return
+        if QMessageBox.question(
+                self, "Download missing",
+                f"“{names[0]}” has {len(missing)} map(s) you don't have.\n\n"
+                "Resolve them online and queue the downloads?",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes) != QMessageBox.Yes:
+            return
+        self.accept()
+        main._download_missing_maps(missing, names[0])
 
     def _diff(self):
         if not self._guard():
@@ -2075,6 +2157,398 @@ class CommandPalette(QDialog):
         self.accept()
         if callable(fn):
             fn()
+
+
+# ----------------------------------------------------------------------------
+# PRACTICE-SET GENERATOR
+# ----------------------------------------------------------------------------
+class PracticeDialog(QDialog):
+    """Pick a mode + star band + size; the parent then builds a collection of that
+    many unowned ranked maps in range for skill progression."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Generate practice set")
+        self.setMinimumWidth(380)
+        self.params = None
+        form = QFormLayout(self)
+        form.setContentsMargins(20, 18, 20, 18)
+        form.setVerticalSpacing(14)
+
+        self.mode = QComboBox()
+        for label, val in MODES:
+            self.mode.addItem(label, val)
+        form.addRow("Mode", self.mode)
+
+        self.lo = QDoubleSpinBox(); self.lo.setRange(0, 15); self.lo.setSingleStep(0.1)
+        self.lo.setValue(5.0); self.lo.setDecimals(1); self.lo.setSuffix(" ★")
+        self.hi = QDoubleSpinBox(); self.hi.setRange(0, 15); self.hi.setSingleStep(0.1)
+        self.hi.setValue(5.6); self.hi.setDecimals(1); self.hi.setSuffix(" ★")
+        band = QHBoxLayout(); band.setContentsMargins(0, 0, 0, 0)
+        band.addWidget(self.lo); band.addWidget(QLabel("to")); band.addWidget(self.hi)
+        w = QWidget(); w.setLayout(band)
+        form.addRow("Star range", w)
+
+        self.count = QSpinBox(); self.count.setRange(1, 200); self.count.setValue(25)
+        form.addRow("How many maps", self.count)
+
+        hint = QLabel("Pulls ranked maps in range you don't already own and builds a "
+                      "collection from them. Widen the band if it comes up short.")
+        hint.setObjectName("hint"); hint.setWordWrap(True)
+        form.addRow(hint)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("Generate")
+        bb.accepted.connect(self._accept); bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def _accept(self):
+        lo, hi = self.lo.value(), self.hi.value()
+        if hi < lo:
+            lo, hi = hi, lo
+        self.params = {"mode": self.mode.currentData(),
+                       "star_min": lo, "star_max": hi, "count": self.count.value()}
+        self.accept()
+
+
+# ----------------------------------------------------------------------------
+# MAPPOOL / BULK-LINK IMPORTER
+# ----------------------------------------------------------------------------
+class MappoolDialog(QDialog):
+    """Paste any text full of osu! beatmap links or ids (a tournament mappool
+    post, a spreadsheet, a plain list) and build a collection from it."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import mappool / links")
+        self.resize(500, 460)
+        self.result_params = None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16); lay.setSpacing(10)
+
+        head = QLabel("Paste beatmap links or ids — anything with "
+                      "osu.ppy.sh/beatmapsets/…, /b/…, or bare set ids. "
+                      "CircleWave pulls them out and builds a collection.")
+        head.setObjectName("hint"); head.setWordWrap(True)
+        lay.addWidget(head)
+
+        self.text = QPlainTextEdit()
+        self.text.setPlaceholderText("NM1  https://osu.ppy.sh/beatmapsets/39804\n"
+                                     "HD1  https://osu.ppy.sh/b/252238\n…")
+        self.text.textChanged.connect(self._recount)
+        lay.addWidget(self.text, 1)
+
+        self.name = QLineEdit()
+        self.name.setPlaceholderText("Collection name")
+        lay.addWidget(self.name)
+
+        self.count_lbl = QLabel("0 beatmap references found")
+        self.count_lbl.setObjectName("hint")
+        lay.addWidget(self.count_lbl)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.ok_btn = bb.button(QDialogButtonBox.Ok)
+        self.ok_btn.setText("Build collection"); self.ok_btn.setEnabled(False)
+        bb.accepted.connect(self._accept); bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _recount(self):
+        n = len(parse_beatmap_refs(self.text.toPlainText()))
+        self.count_lbl.setText(f"{n} beatmap reference(s) found")
+        self.ok_btn.setEnabled(n > 0)
+
+    def _accept(self):
+        refs = parse_beatmap_refs(self.text.toPlainText())
+        if not refs:
+            return
+        name = (self.name.text() or "").strip() or "Mappool"
+        self.result_params = {"refs": refs, "name": name}
+        self.accept()
+
+
+# ----------------------------------------------------------------------------
+# SMART (DYNAMIC) COLLECTIONS
+# ----------------------------------------------------------------------------
+class SmartCollectionDialog(QDialog):
+    """Manage saved dynamic rules. A rule is just a search filter; Apply loads it
+    into the search, Build materialises it into a collection.db collection."""
+
+    def __init__(self, main, parent=None):
+        super().__init__(parent)
+        self.main = main
+        self.setWindowTitle("Smart collections")
+        self.resize(440, 460)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16); lay.setSpacing(10)
+
+        head = QLabel("Saved dynamic rules — a rule is a search that re-runs on "
+                      "demand. Apply it to browse, or Build to write a fresh "
+                      "collection from everything it matches now.")
+        head.setObjectName("hint"); head.setWordWrap(True)
+        lay.addWidget(head)
+
+        self.list = QListWidget()
+        lay.addWidget(self.list, 1)
+
+        btns = QHBoxLayout(); btns.setSpacing(8)
+        for text, slot in [("New from current search", self._new),
+                           ("Apply", self._apply), ("Build collection", self._build),
+                           ("Delete", self._delete)]:
+            b = QPushButton(text); b.setObjectName("smallbtn")
+            b.clicked.connect(slot); btns.addWidget(b)
+        btns.addStretch(1)
+        close = QPushButton("Close"); close.setObjectName("smallbtn")
+        close.clicked.connect(self.accept); btns.addWidget(close)
+        lay.addLayout(btns)
+
+        self.rules = load_smart_rules(self.main.smart_rules_path)
+        self._reload()
+
+    def _reload(self):
+        self.list.clear()
+        for r in self.rules:
+            it = QListWidgetItem(f"{r['name']}   —   {_rule_summary(r['rule'])}")
+            it.setData(Qt.UserRole, r["name"])
+            self.list.addItem(it)
+
+    def _selected(self):
+        it = self.list.currentItem()
+        if not it:
+            return None
+        name = it.data(Qt.UserRole)
+        return next((r for r in self.rules if r["name"] == name), None)
+
+    def _new(self):
+        filt = self.main.filter_bar.filters()
+        filt = dict(filt, **parse_query(filt.get("q", "") or ""))
+        name, ok = QInputDialog.getText(self, "New smart collection",
+                                        "Name this rule (your current search):")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        self.rules = upsert_smart_rule(self.rules, name, filt)
+        save_smart_rules(self.main.smart_rules_path, self.rules)
+        self._reload()
+
+    def _apply(self):
+        r = self._selected()
+        if not r:
+            return
+        self.main.filter_bar.set_filters(r["rule"])
+        self.accept()
+        self.main.new_search()
+
+    def _build(self):
+        r = self._selected()
+        if not r:
+            return
+        self.accept()
+        self.main._build_smart_collection(r["name"], r["rule"])
+
+    def _delete(self):
+        r = self._selected()
+        if not r:
+            return
+        self.rules = [x for x in self.rules if x["name"] != r["name"]]
+        save_smart_rules(self.main.smart_rules_path, self.rules)
+        self._reload()
+
+
+def _rule_summary(rule: dict) -> str:
+    """Short human description of a smart rule's filter."""
+    bits = []
+    if rule.get("q"):
+        scope = {"artist": "artist", "title": "title", "creator": "mapper"}.get(rule.get("option"))
+        bits.append(f"{scope}={rule['q']}" if scope else rule["q"])
+    if rule.get("sr_min") or rule.get("sr_max"):
+        bits.append(f"{rule.get('sr_min') or 0:g}–{rule.get('sr_max') or '∞'}★")
+    if rule.get("bpm_min") or rule.get("bpm_max"):
+        bits.append(f"{rule.get('bpm_min') or 0}–{rule.get('bpm_max') or '∞'} BPM")
+    if rule.get("mode") is not None:
+        bits.append({0: "osu!", 1: "taiko", 2: "catch", 3: "mania"}.get(rule["mode"], ""))
+    return "  ·  ".join(b for b in bits if b) or "any"
+
+
+# ----------------------------------------------------------------------------
+# LIBRARY DASHBOARD + DUPLICATE FINDER
+# ----------------------------------------------------------------------------
+class LibraryDashboardDialog(QDialog):
+    """Read-only overview of the local library from osu!.db, plus a duplicate
+    beatmap-folder / .osz finder over the Songs folder."""
+
+    def __init__(self, songs_dir: str, osu_db_path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Library dashboard")
+        self.resize(460, 520)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 16); lay.setSpacing(12)
+
+        self.body = QLabel("Reading library…")
+        self.body.setWordWrap(True)
+        self.body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.body.setAlignment(Qt.AlignTop)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(self.body)
+        lay.addWidget(scroll, 1)
+
+        self.songs_dir = songs_dir
+        self.osu_db_path = osu_db_path
+        self._dup_folders, self._dup_osz = {}, {}
+
+        row = QHBoxLayout()
+        self.cleanup_btn = QPushButton("Clean up duplicates…")
+        self.cleanup_btn.setObjectName("smallbtn")
+        self.cleanup_btn.setToolTip("Move redundant duplicate folders/.osz to a trash folder")
+        self.cleanup_btn.clicked.connect(self._cleanup_duplicates)
+        self.cleanup_btn.setVisible(False)
+        row.addWidget(self.cleanup_btn)
+        row.addStretch(1)
+        close = QPushButton("Close"); close.setObjectName("smallbtn")
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        lay.addLayout(row)
+
+        self._render(songs_dir, osu_db_path)
+
+    def _render(self, songs_dir, osu_db_path):
+        lines = []
+        beatmaps = []
+        try:
+            beatmaps = read_osu_db(osu_db_path)["beatmaps"]
+        except Exception as e:  # noqa: BLE001
+            log.info("dashboard osu!.db read failed: %s", e)
+        if beatmaps:
+            d = library_dashboard(beatmaps)
+            lines.append(f"<b>{d['sets']:,} beatmapsets</b> · {d['difficulties']:,} difficulties")
+            mode_names = {"osu": "osu!", "taiko": "Taiko", "fruits": "Catch", "mania": "Mania"}
+            modes = "  ".join(f"{mode_names.get(k, k)} {v:,}" for k, v in sorted(d["by_mode"].items()))
+            lines.append(f"<br><b>By mode</b><br>{modes}")
+            st = "  ".join(f"{k} {v:,}" for k, v in sorted(d["by_status"].items(), key=lambda x: -x[1]))
+            lines.append(f"<br><b>By status</b><br>{st}")
+            tm = top_mappers(beatmaps, limit=10)
+            if tm:
+                rows = "<br>".join(f"&nbsp;&nbsp;{i}. {_esc(name)} — {n:,} sets"
+                                   for i, (name, n) in enumerate(tm, 1))
+                lines.append(f"<br><b>Top mappers in your library</b><br>{rows}")
+        else:
+            lines.append("<i>osu!.db not found — set its path in Settings for full stats.</i>")
+
+        stats = library_stats(songs_dir)
+        lines.append(f"<br><b>On disk</b><br>{fmt_size(stats['osz_bytes'])} of .osz in the download folder")
+
+        dup_folders = find_duplicate_song_folders(str(Path(songs_dir)))
+        dup_osz = find_duplicate_osz(str(Path(songs_dir)))
+        self._dup_folders, self._dup_osz = dup_folders, dup_osz
+        if dup_folders:
+            n = sum(len(v) - 1 for v in dup_folders.values())
+            sample = "<br>".join(f"&nbsp;&nbsp;• {sid}: {len(names)} folders"
+                                 for sid, names in list(dup_folders.items())[:15])
+            lines.append(f"<br><b>⚠ {len(dup_folders)} duplicated set folder(s)</b> "
+                         f"(~{n} redundant)<br>{sample}")
+        if dup_osz:
+            lines.append(f"<br><b>⚠ {len(dup_osz)} set(s) with multiple .osz</b> "
+                         "(older versions you can delete)")
+        if not dup_folders and not dup_osz:
+            lines.append("<br>No duplicate folders or .osz found. 🎉")
+        self.body.setText("<br>".join(lines))
+        self.cleanup_btn.setVisible(bool(dup_folders or dup_osz))
+
+    def _cleanup_duplicates(self):
+        names = (redundant_duplicates(self._dup_folders)
+                 + redundant_duplicates(self._dup_osz))
+        if not names:
+            return
+        if QMessageBox.question(
+                self, "Clean up duplicates",
+                f"Move {len(names)} redundant duplicate(s) into a "
+                f"'_CircleWave_trash' folder inside your Songs directory?\n\n"
+                "One copy of each set is kept. Nothing is permanently deleted — "
+                "you can restore or empty the trash folder yourself.",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel) != QMessageBox.Yes:
+            return
+        moved, trash = move_paths_to_trash(self.songs_dir, names)
+        QMessageBox.information(
+            self, "Clean up duplicates",
+            f"Moved {moved} item(s) to:\n{trash}\n\n"
+            "Close osu! and reopen for it to notice the change.")
+        self._render(self.songs_dir, self.osu_db_path)   # refresh the report
+
+
+# ----------------------------------------------------------------------------
+# FOLLOWS (watch a mapper / saved search for new maps)
+# ----------------------------------------------------------------------------
+class FollowsDialog(QDialog):
+    def __init__(self, main, parent=None):
+        super().__init__(parent)
+        self.main = main
+        self.setWindowTitle("Follows")
+        self.resize(420, 420)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16); lay.setSpacing(10)
+
+        head = QLabel("Watch a mapper or your current search. On each launch "
+                      "CircleWave checks for newly-ranked maps and tells you.")
+        head.setObjectName("hint"); head.setWordWrap(True)
+        lay.addWidget(head)
+
+        self.list = QListWidget()
+        lay.addWidget(self.list, 1)
+
+        btns = QHBoxLayout(); btns.setSpacing(8)
+        for text, slot in [("Follow a mapper", self._add_mapper),
+                           ("Follow current search", self._add_search),
+                           ("Check now", self._check),
+                           ("Remove", self._remove)]:
+            b = QPushButton(text); b.setObjectName("smallbtn")
+            b.clicked.connect(slot); btns.addWidget(b)
+        btns.addStretch(1)
+        close = QPushButton("Close"); close.setObjectName("smallbtn")
+        close.clicked.connect(self.accept); btns.addWidget(close)
+        lay.addLayout(btns)
+
+        self.follows = load_follows(self.main.follows_path)
+        self._reload()
+
+    def _reload(self):
+        self.list.clear()
+        for f in self.follows:
+            label = f.get("label") or (f.get("value") if f.get("type") == "mapper"
+                                       else "search")
+            tag = "mapper" if f.get("type") == "mapper" else "search"
+            it = QListWidgetItem(f"[{tag}]  {label}   —   {len(f.get('seen', []))} known")
+            it.setData(Qt.UserRole, id(f))
+            self.list.addItem(it)
+
+    def _persist(self):
+        save_follows(self.main.follows_path, self.follows)
+        self._reload()
+
+    def _add_mapper(self):
+        name, ok = QInputDialog.getText(self, "Follow a mapper", "Mapper (creator) name:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        self.follows.append({"type": "mapper", "value": name, "label": name, "seen": []})
+        self._persist()
+
+    def _add_search(self):
+        filt = self.main.filter_bar.filters()
+        filt = dict(filt, **parse_query(filt.get("q", "") or ""))
+        label = filt.get("q") or "current filters"
+        self.follows.append({"type": "search", "filters": filt,
+                             "label": label, "seen": []})
+        self._persist()
+
+    def _remove(self):
+        it = self.list.currentItem()
+        if not it:
+            return
+        fid = it.data(Qt.UserRole)
+        self.follows = [f for f in self.follows if id(f) != fid]
+        self._persist()
+
+    def _check(self):
+        self.accept()
+        self.main._check_follows(self.follows, announce_none=True)
 
 
 # ----------------------------------------------------------------------------
@@ -2232,6 +2706,8 @@ class MainWindow(QMainWindow):
         self.history_ids = load_history(self.history_path)
         self.queue_path = cfg_dir / "download_queue.json"
         self.search_cache_dir = cfg_dir / "cache"   # offline first-page search cache
+        self.smart_rules_path = cfg_dir / "smart_rules.json"   # dynamic collections
+        self.follows_path = cfg_dir / "follows.json"           # watched mappers/searches
 
         self._build_ui()
         self._setup_audio()
@@ -2243,6 +2719,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self.new_search)  # initial A-Z-ish load
         if self.settings.value("check_app_update", "true") != "false":
             QTimer.singleShot(1500, self._check_app_update)   # quiet startup check
+        QTimer.singleShot(2500, self._check_follows)          # watch followed mappers/searches
 
     def _check_app_update(self):
         """Background check for a newer CircleWave release; a hit shows a
@@ -2640,6 +3117,11 @@ class MainWindow(QMainWindow):
             ("Cancel all downloads", self.cancel_all),
             ("Collection manager", self._open_collections),
             ("Build collection from shown results", self._collection_from_shown),
+            ("Import mappool / links", self._open_mappool),
+            ("Generate practice set", self._open_practice),
+            ("Smart collections", self._open_smart_collections),
+            ("Library dashboard", self._open_library_dashboard),
+            ("Follows (watch mappers / searches)", self._open_follows),
             ("Check for updates", self._check_updates),
             ("Get the latest CircleWave release", self._open_latest_release),
             ("Settings", self._open_settings),
@@ -2800,6 +3282,202 @@ class MainWindow(QMainWindow):
             return
         self._build_collection_from_sets(
             db_path, name, [c.s for c in self.cards.values()], offer_download=None)
+
+    # -- mappool import -----------------------------------------------------
+    def _open_mappool(self):
+        dlg = MappoolDialog(self)
+        if not dlg.exec() or not dlg.result_params:
+            return
+        p = dlg.result_params
+        db_path = self._collection_db_path(prompt=True)
+        if not db_path:
+            return
+        refs, name = p["refs"], p["name"]
+        self.status_label.setText(f"Resolving {len(refs)} map(s) for “{name}”…")
+
+        def job():
+            set_ids, seen = [], set()
+            for kind, rid in refs:
+                try:
+                    sid = rid if kind == "set" else resolve_beatmap_to_set(rid)
+                except Exception as e:  # noqa: BLE001
+                    log.info("mappool ref %s %s failed: %s", kind, rid, e)
+                    continue
+                if sid and sid not in seen:
+                    seen.add(sid)
+                    set_ids.append(sid)
+            # minimal sets; the collection builder fetches per-diff checksums.
+            return [queue_item_from_dict({"id": sid}) for sid in set_ids]
+
+        w = Worker(job)
+        w.signals.result.connect(
+            lambda sets: self._build_collection_from_sets(db_path, name, sets, offer_download=None)
+            if sets else self.status_label.setText("No maps resolved from that text."))
+        w.signals.error.connect(lambda e: self.status_label.setText(f"Mappool import failed: {e}"))
+        self.pool.start(w)
+
+    def _download_missing_maps(self, missing_md5s, label=""):
+        """Resolve a collection's missing md5s to beatmapsets (osu.direct) and
+        queue them. Runs off-thread with progress; enqueues on the GUI thread."""
+        self.status_label.setText(f"Resolving {len(missing_md5s)} missing map(s)…")
+
+        def report(i, total):
+            if i % 5 == 0 or i == total:
+                # Signals from a worker thread to a label aren't strictly safe, but
+                # setText is atomic enough for a progress ping; the real work is the
+                # resolve. Kept lightweight on purpose.
+                self.status_label.setText(f"Resolving missing maps… {i}/{total}")
+
+        def job():
+            return resolve_missing_to_sets(missing_md5s, progress=report)
+
+        w = Worker(job)
+        w.signals.result.connect(lambda sids: self._queue_resolved_sets(sids, label))
+        w.signals.error.connect(lambda e: self.status_label.setText(f"Resolve failed: {e}"))
+        self.pool.start(w)
+
+    def _queue_resolved_sets(self, set_ids, label=""):
+        queued = 0
+        for sid in set_ids:
+            if sid in self.downloaded_ids or sid in self.dl_workers:
+                continue
+            if any(p.id == sid for p in self.dl_pending):
+                continue
+            self.enqueue_download(queue_item_from_dict({"id": sid}))
+            queued += 1
+        tag = f" from “{label}”" if label else ""
+        self.status_label.setText(
+            f"Queued {queued} missing map(s){tag}." if queued
+            else "Nothing new to queue — those maps are already downloaded or queued.")
+
+    # -- practice set -------------------------------------------------------
+    def _owned_ids(self):
+        """Best-effort set of owned beatmapset ids (download history + osu!.db)."""
+        ids = set(self.downloaded_ids) | set(self.history_ids)
+        odb = self.settings.value("osu_db", "")
+        if odb:
+            try:
+                ids |= osu_db_set_ids(odb)
+            except Exception:  # noqa: BLE001
+                pass
+        return ids
+
+    def _open_practice(self):
+        dlg = PracticeDialog(self)
+        if not dlg.exec() or not dlg.params:
+            return
+        p = dlg.params
+        db_path = self._collection_db_path(prompt=True)
+        if not db_path:
+            return
+        owned = self._owned_ids()
+        self.status_label.setText("Finding practice maps…")
+
+        def job():
+            filters = {"q": "", "status": "ranked", "sort": "plays_desc",
+                       "mode": p["mode"], "option": "", "genre": 0, "language": 0,
+                       "bpm_min": 0, "bpm_max": 0, "sr_min": p["star_min"],
+                       "sr_max": p["star_max"], "len_min": 0, "len_max": 0,
+                       "hide_owned": False, "no_video": False}
+            collected, token = [], None
+            for _ in range(4):                 # a few pages -> enough candidates
+                sets, token = search_beatmapsets(filters, token)
+                collected += sets
+                if not token:
+                    break
+            random.shuffle(collected)
+            return build_practice_pool(collected, p["star_min"], p["star_max"],
+                                       p["mode"], owned, p["count"])
+
+        w = Worker(job)
+        w.signals.result.connect(lambda pool: self._practice_ready(pool, db_path, p))
+        w.signals.error.connect(lambda e: self.status_label.setText(f"Practice set failed: {e}"))
+        self.pool.start(w)
+
+    def _practice_ready(self, pool, db_path, p):
+        if not pool:
+            self.status_label.setText("No unowned maps found in that range — widen the band.")
+            return
+        name = f"Practice {p['star_min']:.1f}-{p['star_max']:.1f}★"
+        self._build_collection_from_sets(db_path, name, pool, offer_download=None)
+
+    # -- smart collections --------------------------------------------------
+    def _open_smart_collections(self):
+        SmartCollectionDialog(self, self).exec()
+
+    def _build_smart_collection(self, name, rule):
+        db_path = self._collection_db_path(prompt=True)
+        if not db_path:
+            return
+        self.status_label.setText(f"Materialising “{name}”…")
+
+        def job():
+            base = {"q": "", "status": "ranked", "sort": "ranked_desc", "mode": None,
+                    "option": "", "genre": 0, "language": 0, "bpm_min": 0, "bpm_max": 0,
+                    "sr_min": 0, "sr_max": 0, "len_min": 0, "len_max": 0,
+                    "hide_owned": False, "no_video": False}
+            base.update(rule)
+            collected, token = [], None
+            for _ in range(4):
+                sets, token = search_beatmapsets(base, token)
+                collected += sets
+                if not token:
+                    break
+            return filter_sets_by_rule(collected, rule)
+
+        w = Worker(job)
+        w.signals.result.connect(
+            lambda pool: self._build_collection_from_sets(db_path, name, pool, offer_download=None)
+            if pool else self.status_label.setText("That rule matched no maps."))
+        w.signals.error.connect(lambda e: self.status_label.setText(f"Build failed: {e}"))
+        self.pool.start(w)
+
+    # -- library dashboard --------------------------------------------------
+    def _open_library_dashboard(self):
+        songs = self.settings.value("songs_dir") or str(Path.home() / "osu-beatmaps")
+        odb = self.settings.value("osu_db", "") or str(default_osu_db_path(songs))
+        LibraryDashboardDialog(songs, odb, self).exec()
+
+    # -- follows ------------------------------------------------------------
+    def _open_follows(self):
+        FollowsDialog(self, self).exec()
+
+    def _check_follows(self, follows=None, announce_none=False):
+        follows = follows if follows is not None else load_follows(self.follows_path)
+        if not follows:
+            if announce_none:
+                self.status_label.setText("No follows yet — add one from the Follows dialog.")
+            return
+
+        def job():
+            updated, found = [], []
+            for f in follows:
+                try:
+                    new, uf = check_follow(f, lambda flt: search_beatmapsets(flt, None))
+                except Exception as e:  # noqa: BLE001
+                    log.info("follow check failed: %s", e)
+                    uf, new = f, []
+                updated.append(uf)
+                label = uf.get("label") or uf.get("value") or "search"
+                for s in new:
+                    found.append((label, s))
+            return updated, found
+
+        w = Worker(job)
+        w.signals.result.connect(lambda res: self._follows_checked(res, announce_none))
+        w.signals.error.connect(lambda e: log.info("follows worker error: %s", e))
+        self.pool.start(w)
+
+    def _follows_checked(self, res, announce_none):
+        updated, found = res
+        save_follows(self.follows_path, updated)
+        if found:
+            sample = "  ·  ".join(f"{lbl}: {s.artist} - {s.title}" for lbl, s in found[:3])
+            more = "" if len(found) <= 3 else f"  (+{len(found) - 3} more)"
+            self.status_label.setText(f"{len(found)} new map(s) from your follows.{more}")
+            self._notify("New maps from your follows", sample or f"{len(found)} new maps")
+        elif announce_none:
+            self.status_label.setText("No new maps from your follows.")
 
     def new_search(self):
         # A pasted beatmap link / id jumps straight to that set instead of searching.
@@ -3246,6 +3924,7 @@ class MainWindow(QMainWindow):
 
         row = DownloadRow(s)
         row.cancelRequested.connect(self.cancel_download)
+        row.moveTopRequested.connect(self._move_download_top)
         self.dl_layout.insertWidget(self.dl_layout.count() - 1, row)
         self.dl_rows[s.id] = row
         self.dl_pending.append(s)
@@ -3286,6 +3965,7 @@ class MainWindow(QMainWindow):
                 continue
             row = DownloadRow(s)
             row.cancelRequested.connect(self.cancel_download)
+            row.moveTopRequested.connect(self._move_download_top)
             self.dl_layout.insertWidget(self.dl_layout.count() - 1, row)
             self.dl_rows[s.id] = row
             self.dl_pending.append(s)
@@ -3326,6 +4006,21 @@ class MainWindow(QMainWindow):
                 return
         for s in todo:
             self.enqueue_download(s)
+
+    def _move_download_top(self, setid: int):
+        """Bump a still-pending download to the front of the queue (and its row to
+        the top). No-op for items already downloading/finished."""
+        idx = next((i for i, p in enumerate(self.dl_pending) if p.id == setid), None)
+        if idx is None or idx == 0:
+            return
+        s = self.dl_pending.pop(idx)
+        self.dl_pending.insert(0, s)
+        row = self.dl_rows.get(setid)
+        if row is not None:
+            self.dl_layout.removeWidget(row)
+            self.dl_layout.insertWidget(0, row)     # visually to the top
+        self._persist_queue()
+        self.status_label.setText(f"Moved “{s.artist} - {s.title}” to the front of the queue.")
 
     def _pump(self):
         if self.dl_paused:
@@ -3492,7 +4187,8 @@ class MainWindow(QMainWindow):
 
     def _open_collections(self):
         db_path = self._collection_db_path(prompt=False)
-        CollectionManagerDialog(db_path, self.settings.value("songs_dir", ""), self).exec()
+        CollectionManagerDialog(db_path, self.settings.value("songs_dir", ""),
+                                self.settings.value("osu_db", ""), self).exec()
         self._refresh_downloaded()
 
     def _open_details(self, s: Beatmapset):
