@@ -158,8 +158,11 @@ DOWNLOAD_UA = ("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox
 #
 # osu.direct's plain /d/{id} is the download endpoint; its /api/d/ path rate-limits
 # aggressively (429), so use /d/. chimu.moe and kitsu.moe folded into osu.direct.
+# hinamizawa's download lives at /api/v1/hinai/d/{id} (parallel to its search API);
+# same infra we already use for search, with the complete index (good for graveyards).
 MIRRORS = [
     {"name": "catboy",     "full": "https://catboy.best/d/{id}",                           "novideo": "https://catboy.best/d/{id}?n=1"},
+    {"name": "hinamizawa", "full": "https://mirror.hinamizawa.ai/api/v1/hinai/d/{id}",     "novideo": "https://mirror.hinamizawa.ai/api/v1/hinai/d/{id}?novideo=1"},
     {"name": "osu.direct", "full": "https://osu.direct/d/{id}",                            "novideo": "https://osu.direct/d/{id}?noVideo=1"},
     {"name": "beatconnect","full": "https://beatconnect.io/b/{id}",                        "novideo": None},
     {"name": "nerinyan",   "full": "https://api.nerinyan.moe/d/{id}",                      "novideo": "https://api.nerinyan.moe/d/{id}?noVideo=true"},
