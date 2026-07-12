@@ -4,6 +4,54 @@ All notable changes to CircleWave are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Practice-set generator** — pick a mode + star band + count and CircleWave
+  builds a collection of that many *ranked maps you don't already own* in range
+  (owned = download history + `osu!.db`), for deliberate skill progression.
+  (Command palette → "Generate practice set".)
+- **Smart collections** — save named dynamic rules (a rule is a search filter);
+  **Apply** one to browse, or **Build collection** to materialise a fresh
+  `collection.db` collection from everything it matches right now. Rules persist
+  in `smart_rules.json`.
+- **Library dashboard** — a read-only overview from `osu!.db` (beatmapset /
+  difficulty counts, breakdowns by mode and status, `.osz` size on disk) plus a
+  **duplicate finder** for beatmapset folders and leftover `.osz` versions.
+- **Follows** — watch a mapper or your current search; on each launch CircleWave
+  checks for newly-ranked maps and notifies you (baselines silently on first add,
+  so no back-catalogue spam). Stored in `follows.json`.
+- **Mappool / bulk-link importer** — paste any text full of osu! beatmap links or
+  ids (a tournament mappool post, a spreadsheet, a plain list); CircleWave
+  extracts every reference, resolves them, and builds a collection. Command
+  palette → "Import mappool / links".
+- **Collection tracklist export** — save a collection as a readable `.txt`
+  tracklist (`Artist - Title [diff]`), resolved via `osu!.db`.
+- **Duplicate cleanup** — the Library dashboard can now *remove* the duplicate
+  set folders / `.osz` it finds, moving them into a `_CircleWave_trash` folder
+  (recoverable, never hard-deleted) and keeping one copy of each.
+- **Download missing maps from a collection** — one click in the collection
+  manager resolves every map in a collection you *don't* own (via its checksums)
+  and queues them. Perfect after an osu!Collector or mappool import.
+- **Top mappers** — the Library dashboard now ranks the creators you have the
+  most beatmapsets from.
+- **Queue: move to top** — an ⭱ button on a pending download bumps it to the
+  front so it downloads next.
+
+### Fixed
+- **osu!.db unreadable on current osu! builds** — recent osu!stable (db version
+  20260711) stores per-map star ratings as a Single/float (type tag `0x0c`, 4
+  bytes) instead of the older Double (`0x0d`, 8 bytes). The parser assumed a
+  Double and desynced on the very first beatmap, so *every* `osu!.db` feature
+  silently failed and fell back (exact "✓ In library", collection **Stats** /
+  **Cleanup**, Library dashboard, practice-set owned-exclusion). It now reads the
+  value tag and decodes float or double accordingly — verified against a real
+  109,454-map database.
+- **Collection manager osu!.db path** — Stats/Cleanup now honour the osu!.db path
+  set in Settings (they previously only looked next to the Songs folder), and the
+  "couldn't read" message now names the actual path and reason instead of a
+  misleading "set it in Settings".
+
 ## [2.2.0] - 2026-07-11
 
 ### Added

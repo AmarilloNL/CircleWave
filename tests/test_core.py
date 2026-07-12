@@ -977,3 +977,261 @@ def test_modes_canonical_order():
                            c.Diff("fruits", 2.0, 0, 100, "C", ""),
                            c.Diff("osu", 1.0, 0, 100, "E", "")])
     assert s2.modes == ["osu", "fruits", "mania"]
+
+
+# ==========================================================================
+# BATCH 4 -- practice pool, smart-rule persistence, library dashboard +
+# duplicate finder, and follows.
+# ==========================================================================
+def test_build_practice_pool():
+    def mk(i, sr, mode="osu"):
+        return c.Beatmapset(id=i, title="", artist="", creator="", status="ranked",
+                            bpm=0, play_count=0, favourite_count=0, cover_url="",
+                            diffs=[c.Diff(mode, sr, 180, 120, "N", "")])
+    sets = [mk(1, 5.2), mk(2, 6.9), mk(3, 5.5), mk(4, 3.0), mk(5, 5.4)]
+    pool = c.build_practice_pool(sets, star_min=5.0, star_max=5.6,
+                                 owned_ids={5}, limit=10)
+    assert [s.id for s in pool] == [1, 3]          # 2 too hard, 4 too easy, 5 owned
+    assert len(c.build_practice_pool(sets, 5.0, 5.6, limit=1)) == 1   # cap honoured
+    # mode filter
+    mania = [mk(9, 5.2, "mania")]
+    assert c.build_practice_pool(mania, 5.0, 5.6, mode=0) == []       # no std diff
+    assert len(c.build_practice_pool(mania, 5.0, 5.6, mode=3)) == 1
+
+
+def test_smart_rules_roundtrip(tmp_path):
+    p = tmp_path / "rules.json"
+    assert c.load_smart_rules(p) == []
+    rules = c.upsert_smart_rule([], "6star farm", {"sr_min": 6.0, "mode": 0})
+    rules = c.upsert_smart_rule(rules, "streams", {"bpm_min": 180})
+    c.save_smart_rules(p, rules)
+    got = c.load_smart_rules(p)
+    assert {r["name"] for r in got} == {"6star farm", "streams"}
+    # upsert replaces by name
+    rules = c.upsert_smart_rule(got, "streams", {"bpm_min": 200})
+    assert sum(1 for r in rules if r["name"] == "streams") == 1
+    assert next(r for r in rules if r["name"] == "streams")["rule"]["bpm_min"] == 200
+
+
+def test_library_dashboard():
+    db = [{"md5": "a", "set_id": 1, "mode": 0, "status": 4},
+          {"md5": "b", "set_id": 1, "mode": 1, "status": 4},
+          {"md5": "c", "set_id": 2, "mode": 0, "status": 7}]
+    d = c.library_dashboard(db)
+    assert d["difficulties"] == 3 and d["sets"] == 2
+    assert d["by_mode"] == {"osu": 2, "taiko": 1}
+    assert d["by_status"] == {"ranked": 2, "loved": 1}
+
+
+def test_find_duplicate_song_folders(tmp_path):
+    for name in ["41823 TQBF - The Big Black", "41823 TQBF - The Big Black (1)",
+                 "129891 xi - FREEDOM DiVE", "notanumber folder"]:
+        (tmp_path / name).mkdir()
+    dups = c.find_duplicate_song_folders(tmp_path)
+    assert set(dups) == {41823}
+    assert len(dups[41823]) == 2
+    assert c.find_duplicate_song_folders(tmp_path / "nope") == {}
+
+
+def test_find_duplicate_osz(tmp_path):
+    for name in ["100 a.osz", "100 a v2.osz", "200 b.osz", "notes.txt"]:
+        (tmp_path / name).write_text("x")
+    dups = c.find_duplicate_osz(tmp_path)
+    assert set(dups) == {100} and len(dups[100]) == 2
+
+
+def test_follow_to_filters():
+    f = c.follow_to_filters({"type": "mapper", "value": "Sotarks"})
+    assert f["q"] == "Sotarks" and f["option"] == "creator"
+    f2 = c.follow_to_filters({"type": "search", "filters": {"q": "camellia", "sr_min": 6}})
+    assert f2["q"] == "camellia" and f2["sr_min"] == 6
+
+
+def test_check_follow_baseline_then_new():
+    def mk(i):
+        return c.Beatmapset(id=i, title="", artist="", creator="", status="ranked",
+                            bpm=0, play_count=0, favourite_count=0, cover_url="", diffs=[])
+    state = {"result": [mk(1), mk(2)]}
+    search_fn = lambda filters: (state["result"], None)
+    follow = {"type": "mapper", "value": "x"}
+    new, follow = c.check_follow(follow, search_fn)
+    assert new == [] and follow["seen"] == [1, 2]      # first run = baseline, no spam
+    state["result"] = [mk(3), mk(1), mk(2)]            # a new map (3) appears
+    new, follow = c.check_follow(follow, search_fn)
+    assert [s.id for s in new] == [3]
+    assert set(follow["seen"]) == {1, 2, 3}
+
+
+# ==========================================================================
+# Regression: osu!.db star-rating pairs. Current osu! builds (db version
+# 20260711) store the value as a Single/float (tag 0x0c, 4 bytes); older builds
+# used a Double (tag 0x0d, 8 bytes). Reading the wrong size desyncs the whole
+# file -- the parser must branch on the tag.
+# ==========================================================================
+import struct as _struct
+
+
+def test_int_double_pair_reads_float_and_double():
+    # new float format: 0x08 <int32> 0x0c <float32> -> 10 bytes
+    buf = bytes([0x08]) + _struct.pack("<i", 0) + bytes([0x0c]) + _struct.pack("<f", 2.67)
+    r = c._DbReader(buf); r.int_double_pair()
+    assert r.p == len(buf) == 10
+    # legacy double format: 0x08 <int32> 0x0d <double> -> 14 bytes
+    buf2 = bytes([0x08]) + _struct.pack("<i", 0) + bytes([0x0d]) + _struct.pack("<d", 5.5)
+    r2 = c._DbReader(buf2); r2.int_double_pair()
+    assert r2.p == len(buf2) == 14
+
+
+def _make_osu_db(star_tag=0x0c, version=20260711):
+    """Build a minimal one-beatmap osu!.db using the given star-pair value tag."""
+    def s(x): return c._write_osu_string(x)
+    def i(x): return _struct.pack("<i", x)
+    def L(x): return _struct.pack("<q", x)
+    def f(x): return _struct.pack("<f", x)
+    def d(x): return _struct.pack("<d", x)
+
+    def star_pair(mod, val):
+        v = f(val) if star_tag == 0x0c else d(val)
+        return bytes([0x08]) + i(mod) + bytes([star_tag]) + v
+
+    bm = b""
+    bm += s("Artist") + s("Artist") + s("Title") + s("Title") + s("Creator") + s("Hard")
+    bm += s("audio.mp3") + s("a" * 32) + s("map.osu")
+    bm += bytes([4])                                   # status = ranked
+    bm += _struct.pack("<h", 10) + _struct.pack("<h", 5) + _struct.pack("<h", 0)
+    bm += L(637000000000000000)                        # last modified
+    bm += f(7.0) + f(4.0) + f(6.0) + f(5.0)            # AR CS HP OD
+    bm += d(1.5)                                        # slider velocity
+    for _ in range(4):                                 # star pairs per mode
+        bm += i(1) + star_pair(0, 5.25)
+    bm += i(60000) + i(65000) + i(1000)                # drain / total / preview
+    bm += i(0)                                          # timing points count
+    bm += i(131891) + i(41823) + i(0)                  # beatmap_id / set_id / thread
+    bm += bytes([0, 0, 0, 0])                          # grades
+    bm += _struct.pack("<h", 0)                        # local offset
+    bm += f(0.7)                                        # stack leniency
+    bm += bytes([0])                                    # mode = osu!
+    bm += s("src") + s("tags")
+    bm += _struct.pack("<h", 0)                        # online offset
+    bm += s("font")
+    bm += bytes([0])                                    # unplayed
+    bm += L(0)                                          # last played
+    bm += bytes([0])                                    # is osz2
+    bm += s("folder")
+    bm += L(0)                                          # last checked
+    bm += bytes([0, 0, 0, 0, 0])                       # 5 flags
+    bm += i(0)                                          # last mod time
+    bm += bytes([0])                                    # mania scroll speed
+
+    header = i(version) + i(1) + bytes([0]) + L(0) + s("Player") + i(1)
+    return header + bm
+
+
+@pytest.mark.parametrize("tag", [0x0c, 0x0d])
+def test_read_osu_db_both_star_formats(tmp_path, tag):
+    p = tmp_path / "osu!.db"
+    p.write_bytes(_make_osu_db(star_tag=tag))
+    db = c.read_osu_db(p)
+    assert db["version"] == 20260711 and db["player"] == "Player"
+    assert len(db["beatmaps"]) == 1
+    b = db["beatmaps"][0]
+    assert b["set_id"] == 41823 and b["beatmap_id"] == 131891
+    assert b["md5"] == "a" * 32 and b["mode"] == 0 and b["status"] == 4
+    assert c.osu_db_set_ids(p) == {41823}
+
+
+# ==========================================================================
+# BATCH 5 -- mappool importer, tracklist export, duplicate cleanup.
+# ==========================================================================
+def test_parse_beatmap_refs_mixed():
+    text = (
+        "NM1: https://osu.ppy.sh/beatmapsets/39804#osu/129891\n"
+        "HD1: https://osu.ppy.sh/b/252238\n"
+        "DT1: check https://osu.ppy.sh/beatmapsets/41823 and old /s/1234\n"
+        "plain set id 987654 on its own line\n"
+        "dupe: https://osu.ppy.sh/beatmapsets/39804\n"   # duplicate -> ignored
+    )
+    refs = c.parse_beatmap_refs(text)
+    assert ("set", 39804) in refs
+    assert ("beatmap", 252238) in refs
+    assert ("set", 41823) in refs and ("set", 1234) in refs
+    assert ("set", 987654) in refs
+    # 129891 was the #osu fragment on the 39804 set link -> not a separate beatmap
+    assert ("beatmap", 129891) not in refs
+    # de-duped: 39804 appears once
+    assert sum(1 for k, i in refs if i == 39804) == 1
+
+
+def test_parse_beatmap_refs_empty():
+    assert c.parse_beatmap_refs("") == []
+    assert c.parse_beatmap_refs("no links here, just words and 42") == []  # <5 digits
+
+
+def test_collection_tracklist_and_format():
+    db = [{"md5": "aa", "artist": "xi", "title": "FREEDOM DiVE", "diff": "FOUR DIMENSIONS"},
+          {"md5": "bb", "artist": "Camellia", "title": "GHOST", "diff": "Ascension"}]
+    lines = c.collection_tracklist(["aa", "zz", "bb"], db)
+    assert lines[0] == "xi - FREEDOM DiVE [FOUR DIMENSIONS]"
+    assert lines[1].startswith("(not installed)")
+    assert lines[2] == "Camellia - GHOST [Ascension]"
+    text = c.format_tracklist("My pool", lines)
+    assert "My pool — 3 maps" in text and "1. xi - FREEDOM DiVE" in text
+
+
+def test_redundant_duplicates():
+    dup = {41823: ["X", "X (1)", "X (2)"], 100: ["a", "b"]}
+    rem = c.redundant_duplicates(dup)
+    assert set(rem) == {"X (1)", "X (2)", "b"}          # keep the first of each
+    assert "X" not in rem and "a" not in rem
+
+
+def test_move_paths_to_trash(tmp_path):
+    (tmp_path / "keep").mkdir()
+    (tmp_path / "dupe1").mkdir()
+    (tmp_path / "dupe2.osz").write_text("x")
+    moved, trash = c.move_paths_to_trash(tmp_path, ["dupe1", "dupe2.osz", "missing"])
+    assert moved == 2
+    assert not (tmp_path / "dupe1").exists() and not (tmp_path / "dupe2.osz").exists()
+    assert (tmp_path / "keep").exists()
+    assert (c.Path(trash) / "dupe1").exists() and (c.Path(trash) / "dupe2.osz").exists()
+
+
+def test_osu_db_captures_artist_title(tmp_path):
+    p = tmp_path / "osu!.db"
+    p.write_bytes(_make_osu_db(star_tag=0x0c))
+    b = c.read_osu_db(p)["beatmaps"][0]
+    assert b["artist"] == "Artist" and b["title"] == "Title" and b["creator"] == "Creator"
+
+
+# ==========================================================================
+# BATCH 6 -- missing-map resolution + per-mapper stats.
+# ==========================================================================
+def test_missing_hashes():
+    got = c.missing_hashes(["AA", "bb", "cc", "aa"], known_md5s={"aa"})
+    assert got == ["bb", "cc"]                 # 'AA'/'aa' owned (case-insensitive), deduped
+
+
+def test_resolve_missing_to_sets(monkeypatch):
+    table = {"h1": 100, "h2": 200, "h3": 100, "h4": None}
+
+    def fake(md5):
+        v = table.get(md5)
+        if v is None:
+            raise RuntimeError("nope")
+        return v
+    monkeypatch.setattr(c, "resolve_md5_to_set", fake)
+    seen = []
+    out = c.resolve_missing_to_sets(["h1", "h2", "h3", "h4"],
+                                    progress=lambda i, t: seen.append((i, t)))
+    assert out == [100, 200]                   # 100 deduped, h4 skipped
+    assert seen[-1] == (4, 4)                   # progress ran to completion
+
+
+def test_top_mappers():
+    db = [{"creator": "Sotarks", "set_id": 1}, {"creator": "Sotarks", "set_id": 1},
+          {"creator": "Sotarks", "set_id": 2}, {"creator": "Monstrata", "set_id": 3},
+          {"creator": "", "set_id": 4}, {"creator": "x", "set_id": 0}]
+    top = c.top_mappers(db)
+    assert top[0] == ("Sotarks", 2)            # 2 distinct sets (diffs of set 1 not double-counted)
+    assert ("Monstrata", 1) in top
+    assert all(name for name, _ in top)        # blank creator / bad set_id excluded

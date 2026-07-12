@@ -1081,13 +1081,26 @@ class _DbReader:
         return s
 
     def int_double_pair(self):
-        # osu! stores these as: byte 0x08, Int32, byte 0x0d, Double
-        self.byte(); self.integer(); self.byte(); self.double()
+        # A star-rating entry: an Int TLV then a floating-point TLV.
+        #   0x08 <Int32 mod-combo>  then  <type><value>
+        # The value type varies by osu!.db version: 0x0d = Double (8 bytes, older
+        # builds), 0x0c = Single/float (4 bytes, current builds -- osu! shrank
+        # these to save space). Read the tag and size the value accordingly, or
+        # the whole record desyncs (every star pair would be off by 4 bytes).
+        self.byte(); self.integer()
+        tag = self.byte()
+        if tag == 0x0c:
+            self.single()
+        elif tag == 0x0d:
+            self.double()
+        else:                       # unknown marker: assume legacy Double
+            self.double()
 
 
 def read_osu_db(path, max_beatmaps=None) -> dict:
     """Parse osu!stable's osu!.db into {version, player, beatmaps:[...]}, where each
-    beatmap is {md5, beatmap_id, set_id, folder, status, mode, diff}.
+    beatmap is {md5, beatmap_id, set_id, folder, status, mode, diff, artist,
+    title, creator}.
 
     Follows the documented layout (osu! wiki / OsuParsers). Raises on malformed
     input -- callers should fall back to a folder scan on any exception. Only the
@@ -1106,9 +1119,9 @@ def read_osu_db(path, max_beatmaps=None) -> dict:
     for _ in range(count):
         if has_entry_size:
             r.integer()                        # entry size in bytes
-        r.string(); r.string()                 # artist, artist unicode
-        r.string(); r.string()                 # title, title unicode
-        r.string()                             # creator
+        artist = r.string(); r.string()        # artist, artist unicode
+        title = r.string(); r.string()         # title, title unicode
+        creator = r.string()                   # creator
         diff = r.string()                      # difficulty (version) name
         r.string()                             # audio filename
         md5 = r.string()
@@ -1146,7 +1159,8 @@ def read_osu_db(path, max_beatmaps=None) -> dict:
         r.integer()                            # last modification time
         r.byte()                               # mania scroll speed
         beatmaps.append({"md5": md5, "beatmap_id": beatmap_id, "set_id": set_id,
-                         "folder": folder, "status": status, "mode": mode, "diff": diff})
+                         "folder": folder, "status": status, "mode": mode, "diff": diff,
+                         "artist": artist, "title": title, "creator": creator})
         if max_beatmaps and len(beatmaps) >= max_beatmaps:
             break
     return {"version": version, "player": player,
@@ -2097,3 +2111,379 @@ def check_for_app_update(current: str = APP_VERSION, repo: str = GITHUB_REPO):
     if rel.get("tag") and version_is_newer(rel["tag"], current):
         return rel
     return None
+
+
+# ============================================================================
+# BATCH 4 -- practice-set generator, smart-collection rule persistence,
+# library dashboard + duplicate finder, and mapper/search follows.
+# Pure/Qt-free; exercised by the test suite.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Practice / progression set: N unowned maps in a target star (and mode) band
+# ---------------------------------------------------------------------------
+def build_practice_pool(sets, star_min=0.0, star_max=0.0, mode=None,
+                        owned_ids=None, limit=30) -> list:
+    """Pick up to `limit` sets in the given star (and optional mode) range that
+    aren't already owned -- a ready-made progression collection. Order is
+    preserved (the caller can pre-shuffle for variety)."""
+    owned = set(owned_ids or [])
+    f = {"sr_min": star_min or 0, "sr_max": star_max or 0,
+         "bpm_min": 0, "bpm_max": 0, "len_min": 0, "len_max": 0, "mode": mode}
+    mode_str = {0: "osu", 1: "taiko", 2: "fruits", 3: "mania"}.get(mode)
+    out = []
+    for s in sets:
+        if s.id in owned:
+            continue
+        # Strict mode: a std practice set shouldn't include mania-only maps.
+        # (passes_range is lenient -- it falls back to all diffs -- so enforce
+        # the mode ourselves before the star-range check.)
+        if mode_str and not any(d.mode == mode_str for d in s.diffs):
+            continue
+        if not passes_range(s, f):
+            continue
+        out.append(s)
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Smart-collection rules: saved dynamic filters that re-materialise on demand
+# ---------------------------------------------------------------------------
+def load_smart_rules(path) -> list:
+    """Return saved smart-collection rules: [{'name', 'rule'}, ...]. [] if none."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return []
+    out = []
+    for it in data if isinstance(data, list) else []:
+        if isinstance(it, dict) and it.get("name") and isinstance(it.get("rule"), dict):
+            out.append({"name": str(it["name"]), "rule": it["rule"]})
+    return out
+
+
+def save_smart_rules(path, rules) -> None:
+    """Persist smart-collection rules (best-effort)."""
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        clean = [{"name": str(r["name"]), "rule": r["rule"]}
+                 for r in rules if r.get("name") and isinstance(r.get("rule"), dict)]
+        Path(path).write_text(json.dumps(clean, indent=2))
+    except OSError as e:
+        log.info("could not save smart rules: %s", e)
+
+
+def upsert_smart_rule(rules, name, rule) -> list:
+    """Add or replace a named rule in the list, returning a new list."""
+    out = [r for r in rules if r.get("name") != name]
+    out.append({"name": name, "rule": rule})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Library dashboard + duplicate finder (from osu!.db / the Songs folder)
+# ---------------------------------------------------------------------------
+def library_dashboard(db_beatmaps) -> dict:
+    """Summarise an osu!.db beatmap list: total difficulties, unique sets, and
+    breakdowns by mode and by ranked status. (Star ratings aren't stored in the
+    parsed rows, so no star histogram here.)"""
+    mode_names = {0: "osu", 1: "taiko", 2: "fruits", 3: "mania"}
+    status_names = {0: "unknown", 1: "unsubmitted", 2: "pending",
+                    4: "ranked", 5: "approved", 6: "qualified", 7: "loved"}
+    by_mode, by_status, sets = {}, {}, set()
+    for b in db_beatmaps:
+        mn = mode_names.get(b.get("mode", 0), "osu")
+        by_mode[mn] = by_mode.get(mn, 0) + 1
+        sn = status_names.get(int(b.get("status", 0) or 0), "other")
+        by_status[sn] = by_status.get(sn, 0) + 1
+        if b.get("set_id", 0) > 0:
+            sets.add(b["set_id"])
+    return {"difficulties": len(db_beatmaps), "sets": len(sets),
+            "by_mode": by_mode, "by_status": by_status}
+
+
+_SETID_PREFIX = re.compile(r"^(\d+)\b")
+
+
+def find_duplicate_song_folders(songs_dir) -> dict:
+    """Find beatmapset ids that have more than one folder in the Songs directory
+    (the classic osu! 'I downloaded this twice' clutter). Returns
+    {set_id: [folder_name, ...]} only for ids with 2+ folders. osu! names each
+    folder '<set_id> Artist - Title', so we group on the leading number."""
+    groups = {}
+    try:
+        entries = list(os.scandir(songs_dir))
+    except OSError:
+        return {}
+    for e in entries:
+        if not e.is_dir():
+            continue
+        m = _SETID_PREFIX.match(e.name)
+        if m:
+            groups.setdefault(int(m.group(1)), []).append(e.name)
+    return {sid: sorted(names) for sid, names in groups.items() if len(names) > 1}
+
+
+def find_duplicate_osz(folder) -> dict:
+    """Same idea for a download folder of .osz files: {set_id: [filename, ...]}
+    for set ids with more than one .osz (e.g. leftover older versions)."""
+    groups = {}
+    try:
+        entries = list(os.scandir(folder))
+    except OSError:
+        return {}
+    for e in entries:
+        if not e.is_file() or not e.name.lower().endswith(".osz"):
+            continue
+        m = _SETID_PREFIX.match(e.name)
+        if m:
+            groups.setdefault(int(m.group(1)), []).append(e.name)
+    return {sid: sorted(names) for sid, names in groups.items() if len(names) > 1}
+
+
+# ---------------------------------------------------------------------------
+# Follows: watch a mapper or a saved search for new maps
+# ---------------------------------------------------------------------------
+def follow_to_filters(follow) -> dict:
+    """Build a search filter dict from a follow spec. A 'mapper' follow scopes the
+    search to that creator; a 'search' follow carries its own filter dict."""
+    base = {"q": "", "status": "ranked", "sort": "ranked_desc", "mode": None,
+            "option": "", "genre": 0, "language": 0, "bpm_min": 0, "bpm_max": 0,
+            "sr_min": 0, "sr_max": 0, "len_min": 0, "len_max": 0,
+            "hide_owned": False, "no_video": False}
+    if follow.get("type") == "mapper":
+        base["q"] = follow.get("value", "")
+        base["option"] = "creator"
+    elif isinstance(follow.get("filters"), dict):
+        base.update(follow["filters"])
+    return base
+
+
+def load_follows(path) -> list:
+    """Return saved follows: [{'type','value'/'filters','label','seen':[ids]}]."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return []
+    out = []
+    for it in data if isinstance(data, list) else []:
+        if isinstance(it, dict) and it.get("type"):
+            it.setdefault("seen", [])
+            out.append(it)
+    return out
+
+
+def save_follows(path, follows) -> None:
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(follows, indent=2))
+    except OSError as e:
+        log.info("could not save follows: %s", e)
+
+
+def check_follow(follow, search_fn) -> tuple:
+    """Run a follow's search via `search_fn(filters) -> (sets, token)` and return
+    (new_sets, updated_follow). 'new' = sets whose id isn't in follow['seen'];
+    the returned follow has its 'seen' list refreshed to the current result ids.
+    On the very first check (no prior 'seen'), nothing is 'new' -- we just record
+    the baseline, so the user isn't spammed with the whole back-catalogue."""
+    sets, _ = search_fn(follow_to_filters(follow))
+    ids = [s.id for s in sets]
+    prior = follow.get("seen")
+    updated = dict(follow, seen=ids)
+    if not prior:                      # first run: establish baseline, no alerts
+        return [], updated
+    seen = set(prior)
+    new = [s for s in sets if s.id not in seen]
+    return new, updated
+
+
+# ============================================================================
+# BATCH 5 -- tournament/mappool importer, collection tracklist export,
+# and duplicate cleanup. Pure/Qt-free; exercised by the test suite.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Mappool / bulk-link importer: pull every beatmap reference out of pasted text
+# ---------------------------------------------------------------------------
+# The set pattern also swallows a trailing '#osu/<diff>' fragment so its span
+# covers the whole URL -- otherwise that fragment is mis-read as a separate beatmap.
+_SET_REF = re.compile(r"beatmapsets/(\d+)(?:#(?:osu|taiko|fruits|mania)/\d+)?|/s/(\d+)")
+_MAP_REF = re.compile(r"(?:beatmaps|/b)/(\d+)|#(?:osu|taiko|fruits|mania)/(\d+)")
+
+
+def parse_beatmap_refs(text: str) -> list:
+    """Extract every osu! beatmap reference from a block of text (a forum mappool
+    post, a spreadsheet paste, a list of links...). Returns an ordered, de-duped
+    list of ('set', id) / ('beatmap', id) tuples.
+
+    A beatmapset link wins for its span; a '#osu/<diff>' fragment on the same URL
+    is ignored (the set link already covers it). Bare 5+ digit numbers on their
+    own are treated as set ids so a plain id list still works."""
+    refs, seen = [], set()
+
+    def add(kind, num):
+        key = (kind, num)
+        if num and key not in seen:
+            seen.add(key)
+            refs.append(key)
+
+    # spans already consumed by a beatmapset match, so we don't also read their
+    # trailing #osu/<diff> fragment as a separate beatmap.
+    consumed = []
+    for m in _SET_REF.finditer(text or ""):
+        consumed.append((m.start(), m.end()))
+        add("set", int(m.group(1) or m.group(2)))
+    for m in _MAP_REF.finditer(text or ""):
+        if any(a <= m.start() < b for a, b in consumed):
+            continue
+        add("beatmap", int(m.group(1) or m.group(2)))
+    # bare id list: numbers not part of any URL match
+    urlspans = consumed + [(m.start(), m.end()) for m in _MAP_REF.finditer(text or "")]
+    for m in re.finditer(r"(?<![\w/#])(\d{5,})(?![\w])", text or ""):
+        if not any(a <= m.start() < b for a, b in urlspans):
+            add("set", int(m.group(1)))
+    return refs
+
+
+# ---------------------------------------------------------------------------
+# Collection tracklist export (needs osu!.db for names)
+# ---------------------------------------------------------------------------
+def collection_tracklist(hashes, db_beatmaps) -> list:
+    """Human-readable lines for a collection's maps, resolving md5s to
+    'Artist - Title [diff]' via osu!.db. Maps not installed are marked. Order
+    follows the collection's hash order."""
+    by_md5 = {b["md5"].lower(): b for b in db_beatmaps if b.get("md5")}
+    lines = []
+    for h in hashes:
+        b = by_md5.get((h or "").lower())
+        if b:
+            name = f"{b.get('artist', '')} - {b.get('title', '')}".strip(" -")
+            diff = b.get("diff", "")
+            lines.append(f"{name} [{diff}]" if diff else name)
+        else:
+            lines.append(f"(not installed)  {h}")
+    return lines
+
+
+def format_tracklist(name, lines) -> str:
+    """Wrap tracklist lines into a shareable text block with a header."""
+    head = f"{name} — {len(lines)} maps"
+    body = "\n".join(f"{i:>3}. {ln}" for i, ln in enumerate(lines, 1))
+    return f"{head}\n{'=' * len(head)}\n{body}\n"
+
+
+# ---------------------------------------------------------------------------
+# Duplicate cleanup: pick which duplicate folders/files are redundant
+# ---------------------------------------------------------------------------
+def redundant_duplicates(dup_map, keep="first") -> list:
+    """Given {set_id: [names...]} (from find_duplicate_song_folders/_osz), return
+    the flat list of names that are safe to remove -- all but one kept per set.
+    keep='first' keeps the alphabetically-first (usually the un-suffixed original,
+    e.g. 'X' over 'X (1)')."""
+    out = []
+    for _sid, names in dup_map.items():
+        ordered = sorted(names)
+        keeper = ordered[0] if keep == "first" else ordered[-1]
+        out.extend(n for n in ordered if n != keeper)
+    return out
+
+
+def move_paths_to_trash(base_dir, names, trash_name="_CircleWave_trash") -> tuple:
+    """Move the given entries (folders or files, relative to base_dir) into a
+    trash subfolder rather than hard-deleting, so a mistake is recoverable.
+    Returns (moved_count, trash_dir). Best-effort per item."""
+    import shutil
+    base = Path(base_dir)
+    trash = base / trash_name
+    trash.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for name in names:
+        src = base / name
+        if not src.exists():
+            continue
+        dest = trash / name
+        try:
+            if dest.exists():                  # avoid clobbering a prior trashed copy
+                dest = trash / f"{name}__{int(time.time())}"
+            shutil.move(str(src), str(dest))
+            moved += 1
+        except OSError as e:
+            log.info("could not trash %s: %s", src, e)
+    return moved, str(trash)
+
+
+# ============================================================================
+# BATCH 6 -- download missing maps from a collection, per-mapper library stats.
+# ============================================================================
+OSU_DIRECT_MD5 = "https://osu.direct/api/v2/md5/{md5}"
+
+
+def resolve_md5_to_set(md5: str) -> int:
+    """Resolve a single .osu md5 checksum to its beatmapset id via osu.direct.
+    Used to turn a collection's hashes (which is all a collection.db stores) back
+    into downloadable sets. Raises on failure."""
+    r = SESSION.get(OSU_DIRECT_MD5.format(md5=md5),
+                    headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    sid = (data.get("beatmapset_id") or data.get("set_id")
+           or (data.get("beatmapset") or {}).get("id"))
+    if not sid:
+        raise RuntimeError(f"no beatmapset for md5 {md5}")
+    return int(sid)
+
+
+def missing_hashes(hashes, known_md5s) -> list:
+    """The subset of `hashes` not present in `known_md5s` (case-insensitive),
+    order-preserved and de-duped -- e.g. a collection's maps not in osu!.db."""
+    known = {h.lower() for h in known_md5s}
+    out, seen = [], set()
+    for h in hashes:
+        lo = (h or "").lower()
+        if lo and lo not in known and lo not in seen:
+            seen.add(lo)
+            out.append(h)
+    return out
+
+
+def resolve_missing_to_sets(hashes, progress=None) -> list:
+    """Resolve a list of md5s to distinct beatmapset ids (order-preserved), for
+    queueing a download. Unresolvable hashes are skipped. `progress(i, total)` is
+    called as it goes, if given."""
+    out, seen = [], set()
+    total = len(hashes)
+    for i, h in enumerate(hashes, 1):
+        try:
+            sid = resolve_md5_to_set(h)
+        except Exception as e:  # noqa: BLE001
+            log.info("md5 %s did not resolve: %s", h, e)
+            sid = None
+        if sid and sid not in seen:
+            seen.add(sid)
+            out.append(sid)
+        if progress:
+            progress(i, total)
+    return out
+
+
+def top_mappers(db_beatmaps, limit=15) -> list:
+    """Rank creators by how many distinct beatmapsets of theirs are installed.
+    Returns [(creator, set_count), ...] descending. Counts sets, not difficulties,
+    so a mapper with one huge set doesn't dominate."""
+    seen, counts = set(), {}
+    for b in db_beatmaps:
+        creator = b.get("creator", "")
+        sid = b.get("set_id", 0) or 0
+        if not creator or sid <= 0:
+            continue
+        key = (creator, sid)
+        if key in seen:
+            continue
+        seen.add(key)
+        counts[creator] = counts.get(creator, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower()))[:limit]
