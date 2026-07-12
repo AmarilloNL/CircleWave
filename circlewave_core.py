@@ -1100,7 +1100,7 @@ class _DbReader:
 def read_osu_db(path, max_beatmaps=None) -> dict:
     """Parse osu!stable's osu!.db into {version, player, beatmaps:[...]}, where each
     beatmap is {md5, beatmap_id, set_id, folder, status, mode, diff, artist,
-    title, creator}.
+    title, creator, total_time}.
 
     Follows the documented layout (osu! wiki / OsuParsers). Raises on malformed
     input -- callers should fall back to a folder scan on any exception. Only the
@@ -1135,7 +1135,7 @@ def read_osu_db(path, max_beatmaps=None) -> dict:
             for _ in range(r.integer()):
                 r.int_double_pair()
         r.integer()                            # drain time
-        r.integer()                            # total time
+        total_time = r.integer()               # total time (ms)
         r.integer()                            # preview time
         for _ in range(r.integer()):           # timing points
             r.double(); r.double(); r.boolean()
@@ -1160,7 +1160,8 @@ def read_osu_db(path, max_beatmaps=None) -> dict:
         r.byte()                               # mania scroll speed
         beatmaps.append({"md5": md5, "beatmap_id": beatmap_id, "set_id": set_id,
                          "folder": folder, "status": status, "mode": mode, "diff": diff,
-                         "artist": artist, "title": title, "creator": creator})
+                         "artist": artist, "title": title, "creator": creator,
+                         "total_time": total_time})
         if max_beatmaps and len(beatmaps) >= max_beatmaps:
             break
     return {"version": version, "player": player,
@@ -1892,6 +1893,19 @@ class MirrorStats:
         return sorted(names, key=key)
 
 
+def order_mirrors(mirrors, stats) -> list:
+    """Reorder a list of mirror dicts (each with a 'name') best-first by their
+    recorded health. Returns a new list; `mirrors` unchanged. `stats` may be None
+    (returns a copy in the given order). Pure so it's unit-tested -- the download
+    worker calls this instead of open-coding it (that open-coding shipped a crash:
+    stats.order() returns names, which were wrongly indexed as dicts)."""
+    if stats is None:
+        return list(mirrors)
+    order = stats.order([m["name"] for m in mirrors])
+    rank = {name: i for i, name in enumerate(order)}
+    return sorted(mirrors, key=lambda m: rank.get(m["name"], len(order)))
+
+
 # ============================================================================
 # BATCH 2 -- smart (rule-based) collections, osu!Collector import, and an
 # offline search-result cache. Pure/Qt-free; exercised by the test suite.
@@ -2487,3 +2501,64 @@ def top_mappers(db_beatmaps, limit=15) -> list:
         seen.add(key)
         counts[creator] = counts.get(creator, 0) + 1
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower()))[:limit]
+
+
+# ============================================================================
+# BATCH 7 -- recommendations ("For You"), similar maps, library length.
+# ============================================================================
+def similar_search_filter(s: "Beatmapset", band: float = 0.6) -> dict:
+    """Build a search filter for maps 'like this one': the same mode and a star
+    band around the set's hardest difficulty. Meant for a 'more like this' action
+    from the detail panel."""
+    lo, hi = s.sr_range
+    center = hi or lo
+    mode = None
+    if s.diffs:
+        top = max(s.diffs, key=lambda d: d.sr)
+        mode = {"osu": 0, "taiko": 1, "fruits": 2, "mania": 3}.get(top.mode)
+    return {"q": "", "status": "ranked", "sort": "plays_desc", "mode": mode,
+            "option": "", "genre": 0, "language": 0,
+            "bpm_min": 0, "bpm_max": 0,
+            "sr_min": round(max(0.0, center - band), 2),
+            "sr_max": round(center + band, 2),
+            "len_min": 0, "len_max": 0, "hide_owned": True, "no_video": False}
+
+
+def pick_unowned(sets, owned_ids, limit=0) -> list:
+    """Filter out owned sets (and de-dupe by id), optionally capping to `limit`.
+    Used to assemble recommendation results."""
+    owned = set(owned_ids or [])
+    out, seen = [], set()
+    for s in sets:
+        if s.id in owned or s.id in seen:
+            continue
+        seen.add(s.id)
+        out.append(s)
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+def recommendation_mappers(db_beatmaps, top_n=6) -> list:
+    """The creator names you own the most sets from -- the seeds for 'For You'
+    recommendations. Thin wrapper over top_mappers returning just the names."""
+    return [name for name, _ in top_mappers(db_beatmaps, limit=top_n)]
+
+
+def library_total_length(db_beatmaps) -> int:
+    """Approximate total mapped-audio length of the library, in seconds: one
+    difficulty's total_time per beatmapset (so multi-diff sets aren't counted
+    many times). osu!.db stores total_time in ms."""
+    per_set = {}
+    for b in db_beatmaps:
+        sid = b.get("set_id", 0) or 0
+        if sid > 0:
+            per_set[sid] = max(per_set.get(sid, 0), int(b.get("total_time", 0) or 0))
+    return sum(per_set.values()) // 1000
+
+
+def fmt_hours(seconds: int) -> str:
+    """'3h 42m' / '58m' from a second count."""
+    m = max(0, seconds) // 60
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m" if h else f"{m}m"

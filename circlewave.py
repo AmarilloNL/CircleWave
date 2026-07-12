@@ -172,10 +172,7 @@ class DownloadWorker(QRunnable):
         self.no_video = no_video
         # Prefer the mirrors that have proven fast + reliable this session, falling
         # back through the rest in their configured order (see MirrorStats.order).
-        if stats is not None:
-            rank = {m["name"]: i for i, m in enumerate(stats.order([m["name"] for m in mirrors]))}
-            mirrors = sorted(mirrors, key=lambda m: rank.get(m["name"], 0))
-        self.mirrors = mirrors
+        self.mirrors = order_mirrors(mirrors, stats)
         self.stats = stats
         self.signals = DownloadSignals()
         # threading.Event, not a bare bool: the flag is set from the GUI thread
@@ -2160,6 +2157,62 @@ class CommandPalette(QDialog):
 
 
 # ----------------------------------------------------------------------------
+# SHORTCUTS / HELP
+# ----------------------------------------------------------------------------
+class HelpDialog(QDialog):
+    """A cheat-sheet of keyboard shortcuts and where to find things."""
+
+    SHORTCUTS = [
+        ("Ctrl+F", "Focus the search box"),
+        ("Ctrl+K", "Command palette (every action)"),
+        ("F5", "Re-run the search"),
+        ("Ctrl+R", "Open a random result"),
+        ("Ctrl+D", "Download all shown"),
+        ("Ctrl+L", "Toggle list / card view"),
+        ("Ctrl+Shift+C", "Collection manager"),
+        ("Ctrl+,", "Settings"),
+        ("F1", "This help"),
+        ("Esc", "Stop audio preview"),
+        ("← ↑ → ↓", "Move card focus (in the results grid)"),
+        ("Enter", "Open details of the focused card"),
+        ("P / D / X", "Focused card: preview / download / select"),
+    ]
+    TIPS = [
+        "Search operators: <b>star&gt;6  bpm&lt;200  mode=mania  artist=camellia</b>",
+        "Paste a beatmap link or id into the search box to jump to that set.",
+        "Command palette (Ctrl+K) reaches practice sets, smart collections, the "
+        "library dashboard, follows, the mappool importer and more.",
+        "Collection manager → Download missing to grab everything in a collection "
+        "you don't own yet.",
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Shortcuts & tips")
+        self.resize(460, 520)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 16); lay.setSpacing(10)
+
+        rows = "".join(
+            f"<tr><td style='padding:2px 14px 2px 0'><b>{_esc(k)}</b></td>"
+            f"<td>{_esc(v)}</td></tr>" for k, v in self.SHORTCUTS)
+        tips = "".join(f"<li style='margin-bottom:5px'>{t}</li>" for t in self.TIPS)
+        body = QLabel(
+            f"<h3>Keyboard shortcuts</h3><table>{rows}</table>"
+            f"<h3 style='margin-top:14px'>Tips</h3><ul style='margin-left:-18px'>{tips}</ul>")
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        body.setAlignment(Qt.AlignTop)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(body)
+        lay.addWidget(scroll, 1)
+
+        close = QPushButton("Close"); close.setObjectName("smallbtn")
+        close.clicked.connect(self.accept)
+        row = QHBoxLayout(); row.addStretch(1); row.addWidget(close)
+        lay.addLayout(row)
+
+
+# ----------------------------------------------------------------------------
 # PRACTICE-SET GENERATOR
 # ----------------------------------------------------------------------------
 class PracticeDialog(QDialog):
@@ -2418,7 +2471,9 @@ class LibraryDashboardDialog(QDialog):
             log.info("dashboard osu!.db read failed: %s", e)
         if beatmaps:
             d = library_dashboard(beatmaps)
-            lines.append(f"<b>{d['sets']:,} beatmapsets</b> · {d['difficulties']:,} difficulties")
+            hours = fmt_hours(library_total_length(beatmaps))
+            lines.append(f"<b>{d['sets']:,} beatmapsets</b> · {d['difficulties']:,} "
+                         f"difficulties · ~{hours} of mapped audio")
             mode_names = {"osu": "osu!", "taiko": "Taiko", "fruits": "Catch", "mania": "Mania"}
             modes = "  ".join(f"{mode_names.get(k, k)} {v:,}" for k, v in sorted(d["by_mode"].items()))
             lines.append(f"<br><b>By mode</b><br>{modes}")
@@ -2559,6 +2614,7 @@ class DetailDialog(QDialog):
     including scoped searches for more maps by the same mapper or artist."""
     downloadRequested = Signal(object)
     searchRequested = Signal(str, str)      # option ("creator"/"artist"), text
+    similarRequested = Signal(object)       # find maps like this set
 
     def __init__(self, s: Beatmapset, owned: bool, parent=None):
         super().__init__(parent)
@@ -2624,6 +2680,12 @@ class DetailDialog(QDialog):
             b = QPushButton("More by artist")
             b.setObjectName("smallbtn")
             b.clicked.connect(lambda: self._search("artist", s.artist))
+            btns.addWidget(b)
+        if s.diffs:
+            b = QPushButton("Similar maps")
+            b.setObjectName("smallbtn")
+            b.setToolTip("Ranked maps around this difficulty, same mode")
+            b.clicked.connect(lambda: (self.similarRequested.emit(self.s), self.accept()))
             btns.addWidget(b)
         web = QPushButton("Open on osu!")
         web.setObjectName("smallbtn")
@@ -3004,7 +3066,11 @@ class MainWindow(QMainWindow):
         sc("Ctrl+,", self._open_settings)
         sc("Ctrl+K", self._open_command_palette)
         sc("Ctrl+L", self.toggle_view_mode)
+        sc("F1", self._open_help)
         sc("Escape", self.stop_preview)
+
+    def _open_help(self):
+        HelpDialog(self).exec()
 
         # Grid navigation -- scoped to the results area (WidgetWithChildren), so
         # these never fire while the search box or a combo has focus.
@@ -3117,6 +3183,7 @@ class MainWindow(QMainWindow):
             ("Cancel all downloads", self.cancel_all),
             ("Collection manager", self._open_collections),
             ("Build collection from shown results", self._collection_from_shown),
+            ("✨ For You — recommendations", self._open_for_you),
             ("Import mappool / links", self._open_mappool),
             ("Generate practice set", self._open_practice),
             ("Smart collections", self._open_smart_collections),
@@ -3124,6 +3191,7 @@ class MainWindow(QMainWindow):
             ("Follows (watch mappers / searches)", self._open_follows),
             ("Check for updates", self._check_updates),
             ("Get the latest CircleWave release", self._open_latest_release),
+            ("Shortcuts & tips (F1)", self._open_help),
             ("Settings", self._open_settings),
         ]
         CommandPalette(actions, self).exec()
@@ -3349,6 +3417,60 @@ class MainWindow(QMainWindow):
         self.status_label.setText(
             f"Queued {queued} missing map(s){tag}." if queued
             else "Nothing new to queue — those maps are already downloaded or queued.")
+
+    # -- "For You" recommendations -----------------------------------------
+    def _open_for_you(self):
+        songs = self.settings.value("songs_dir") or str(Path.home() / "osu-beatmaps")
+        odb = self.settings.value("osu_db", "") or str(default_osu_db_path(songs))
+        owned = self._owned_ids()
+        self.status_label.setText("Building recommendations from your top mappers…")
+
+        def job():
+            try:
+                beatmaps = read_osu_db(odb)["beatmaps"]
+            except Exception:  # noqa: BLE001
+                return None
+            if not beatmaps:
+                return None
+            collected = []
+            for name in recommendation_mappers(beatmaps, top_n=6):
+                f = {"q": name, "option": "creator", "status": "ranked",
+                     "sort": "ranked_desc", "mode": None, "genre": 0, "language": 0,
+                     "bpm_min": 0, "bpm_max": 0, "sr_min": 0, "sr_max": 0,
+                     "len_min": 0, "len_max": 0, "hide_owned": False, "no_video": False}
+                try:
+                    sets, _ = search_beatmapsets(f, None)
+                except Exception:  # noqa: BLE001
+                    sets = []
+                collected += sets
+            random.shuffle(collected)
+            return pick_unowned(collected, owned, limit=48)
+
+        w = Worker(job)
+        w.signals.result.connect(self._show_recommendations)
+        w.signals.error.connect(lambda e: self.status_label.setText(f"Recommendations failed: {e}"))
+        self.pool.start(w)
+
+    def _show_recommendations(self, sets):
+        if sets is None:
+            self.status_label.setText("Recommendations need osu!.db — set its path in Settings.")
+            return
+        if not sets:
+            self.status_label.setText("No new recommendations right now — you own a lot already! 🎉")
+            return
+        if self.pack:
+            self._exit_pack_mode(refresh=False)
+        self.cur_filters = self.filter_bar.filters()
+        self.cursor_token = None
+        self.more = False
+        self.auto_pages = 0
+        self._search_cached = True
+        self._clear_grid()
+        self._refresh_downloaded()
+        for s in sets:
+            self._add_card(s, s.id in self.downloaded_ids)
+        self.status_label.setText(
+            f"✨ For You — {len(sets)} maps from mappers you own the most, not yet in your library")
 
     # -- practice set -------------------------------------------------------
     def _owned_ids(self):
@@ -4195,7 +4317,25 @@ class MainWindow(QMainWindow):
         dlg = DetailDialog(s, s.id in self.downloaded_ids, self)
         dlg.downloadRequested.connect(self.enqueue_download)
         dlg.searchRequested.connect(self._search_field)
+        dlg.similarRequested.connect(self._search_similar)
         dlg.exec()
+
+    def _search_similar(self, s: Beatmapset):
+        """Browse ranked maps around this set's difficulty (same mode). Runs
+        programmatically since the star band isn't one of the UI's preset ranges."""
+        if self.pack:
+            self._exit_pack_mode(refresh=False)
+        self.cur_filters = similar_search_filter(s)
+        self.filter_bar.query.clear()
+        self.cursor_token = None
+        self.more = True
+        self.auto_pages = 0
+        self._search_cached = True     # don't cache a derived search
+        self._clear_grid()
+        self._refresh_downloaded()
+        self._fetch_page()
+        lo, hi = self.cur_filters["sr_min"], self.cur_filters["sr_max"]
+        self.status_label.setText(f"Maps like “{s.title}” — {lo:g}–{hi:g}★, same mode")
 
     def _open_ref(self, kind: str, rid: int):
         """Open the detail panel for a pasted beatmapset/beatmap reference."""
