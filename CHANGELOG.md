@@ -4,6 +4,26 @@ All notable changes to CircleWave are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Downloads crashed on start** — the mirror-health reordering added in 2.2.0
+  indexed a mirror *name* (a string) as if it were a dict, throwing
+  `TypeError: string indices must be integers` the moment any download began
+  (single, batch, or pack). The ordering is now a tested pure helper
+  (`order_mirrors`) and downloads work again. This affected 2.2.0 and 2.3.0.
+
+### Added
+- **"For You" recommendations** — command palette → ✨ For You surfaces ranked
+  maps from the mappers you own the most sets from, filtered to ones you don't
+  already have.
+- **Similar maps** — a "Similar maps" button in the beatmap detail panel browses
+  ranked maps around that set's difficulty in the same mode.
+- **Shortcuts & tips (F1)** — a cheat-sheet dialog of every keyboard shortcut and
+  where to find the newer features.
+- **Library length** — the dashboard now shows the approximate total mapped-audio
+  length of your library (e.g. "~412h 9m of mapped audio").
+
 ## [2.3.0] - 2026-07-11
 
 ### Added

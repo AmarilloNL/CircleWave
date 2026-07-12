@@ -1235,3 +1235,62 @@ def test_top_mappers():
     assert top[0] == ("Sotarks", 2)            # 2 distinct sets (diffs of set 1 not double-counted)
     assert ("Monstrata", 1) in top
     assert all(name for name, _ in top)        # blank creator / bad set_id excluded
+
+
+# ==========================================================================
+# BATCH 7 -- similar maps, recommendations, library length.
+# ==========================================================================
+def _sset(sid, sr, mode="osu"):
+    return c.Beatmapset(id=sid, title="", artist="", creator="", status="ranked",
+                        bpm=0, play_count=0, favourite_count=0, cover_url="",
+                        diffs=[c.Diff(mode, sr, 180, 120, "N", "")])
+
+
+def test_similar_search_filter():
+    s = _sset(1, 6.2, "mania")
+    f = c.similar_search_filter(s, band=0.5)
+    assert f["mode"] == 3
+    assert f["sr_min"] == 5.7 and f["sr_max"] == 6.7
+    assert f["hide_owned"] is True and f["status"] == "ranked"
+
+
+def test_pick_unowned():
+    sets = [_sset(1, 5), _sset(2, 5), _sset(3, 5), _sset(2, 5)]
+    out = c.pick_unowned(sets, owned_ids={1}, limit=2)
+    assert [s.id for s in out] == [2, 3]        # 1 owned, 2 deduped, capped at 2
+
+
+def test_recommendation_mappers():
+    db = [{"creator": "A", "set_id": 1}, {"creator": "A", "set_id": 2},
+          {"creator": "B", "set_id": 3}]
+    assert c.recommendation_mappers(db, top_n=2) == ["A", "B"]
+
+
+def test_library_total_length_and_fmt():
+    db = [{"set_id": 1, "total_time": 120000}, {"set_id": 1, "total_time": 130000},
+          {"set_id": 2, "total_time": 60000}]
+    # set 1 counted once (max diff = 130s), set 2 = 60s -> 190s
+    assert c.library_total_length(db) == 190
+    assert c.fmt_hours(190) == "3m"
+    assert c.fmt_hours(3742) == "1h 2m"
+
+
+# ==========================================================================
+# Regression: order_mirrors must accept mirror *dicts* and use MirrorStats.order
+# (which returns names). A previous open-coded version indexed a name string as a
+# dict and crashed every download.
+# ==========================================================================
+def test_order_mirrors_with_dicts():
+    mirrors = [{"name": "catboy", "full": "a"}, {"name": "nerinyan", "full": "b"},
+               {"name": "sayobot", "full": "c"}]
+    # None stats -> unchanged copy
+    assert c.order_mirrors(mirrors, None) == mirrors
+    assert c.order_mirrors(mirrors, None) is not mirrors
+    ms = c.MirrorStats()
+    ms.record("nerinyan", ok=True, nbytes=10_000_000, secs=1.0)   # proven fast
+    ms.record("catboy", ok=False)                                 # failed
+    ordered = c.order_mirrors(mirrors, ms)
+    names = [m["name"] for m in ordered]
+    assert names[0] == "nerinyan"           # reliable+fast first
+    assert names[-1] == "catboy"            # repeat failer last
+    assert len(ordered) == 3 and all(isinstance(m, dict) for m in ordered)
