@@ -13,9 +13,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   used for search, which is handy for graveyard maps. More redundancy overall.
 
 ### Changed
-- **Default mirror order** re-tuned fastest/most-reliable first (catboy,
-  hinamizawa, osu.direct, beatconnect, nerinyan, sayobot) based on real
-  throughput tests.
+- **Default mirror order**: hinamizawa, nerinyan, catboy, sayobot, beatconnect,
+  osu.direct. beatconnect and osu.direct are last as keyless fallbacks (they
+  benefit from a manual API key). The queue still reorders live by measured
+  per-session speed/reliability on top of this default.
   Note this is only a *seed*: at download time the queue already reorders mirrors
   by the speed and reliability it measures per session, since real mirror speed
   swings a lot per map (CDN cache hit vs cold generate) and rate-limit state.

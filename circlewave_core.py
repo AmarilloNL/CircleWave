@@ -150,24 +150,20 @@ DOWNLOAD_UA = ("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox
 # Download mirrors, tried top-to-bottom. Each entry: name, full url, no-video url.
 # {id} is substituted with the beatmapset id.
 #
-# The order below is a sensible *default* (fastest/most-reliable first), but real
-# per-mirror speed varies a lot by map (CDN cache hit vs cold generate), time of
-# day, and rate-limit state -- so at download time the queue reorders mirrors by
-# the speed/reliability it actually measured this session (see MirrorStats /
-# order_mirrors). The static order just seeds that.
-#
-# osu.direct's plain /d/{id} is the download endpoint; its /api/d/ path rate-limits
-# aggressively (429), so use /d/. chimu.moe and kitsu.moe folded into osu.direct.
-# hinamizawa's download lives at /api/v1/hinai/d/{id} (parallel to its search API);
-# same infra we already use for search, with the complete index (good for graveyards).
+# Order is the configured default; at download time the queue further reorders by
+# the speed/reliability it measured this session (see MirrorStats / order_mirrors).
+# beatconnect and osu.direct are last on purpose: they're the ones that benefit
+# from / expect a manual API key, so they serve as fallbacks behind the keyless
+# mirrors. (osu.direct download = /d/{id}; the /api/d/ path rate-limits with 429.
+# hinamizawa download = /api/v1/hinai/d/{id}, same infra used for search, with the
+# complete index -- good for graveyard maps.)
 MIRRORS = [
-    {"name": "catboy",     "full": "https://catboy.best/d/{id}",                           "novideo": "https://catboy.best/d/{id}?n=1"},
     {"name": "hinamizawa", "full": "https://mirror.hinamizawa.ai/api/v1/hinai/d/{id}",     "novideo": "https://mirror.hinamizawa.ai/api/v1/hinai/d/{id}?novideo=1"},
-    {"name": "osu.direct", "full": "https://osu.direct/d/{id}",                            "novideo": "https://osu.direct/d/{id}?noVideo=1"},
-    {"name": "beatconnect","full": "https://beatconnect.io/b/{id}",                        "novideo": None},
     {"name": "nerinyan",   "full": "https://api.nerinyan.moe/d/{id}",                      "novideo": "https://api.nerinyan.moe/d/{id}?noVideo=true"},
-    # Sayobot is China-hosted and slow/throttled from outside CN, so it's the last resort.
+    {"name": "catboy",     "full": "https://catboy.best/d/{id}",                           "novideo": "https://catboy.best/d/{id}?n=1"},
     {"name": "sayobot",    "full": "https://dl.sayobot.cn/beatmaps/download/full/{id}",    "novideo": "https://dl.sayobot.cn/beatmaps/download/novideo/{id}"},
+    {"name": "beatconnect","full": "https://beatconnect.io/b/{id}",                        "novideo": None},
+    {"name": "osu.direct", "full": "https://osu.direct/d/{id}",                            "novideo": "https://osu.direct/d/{id}?noVideo=1"},
 ]
 
 MODES = [("Any", None), ("osu!", 0), ("taiko", 1), ("catch", 2), ("mania", 3)]
